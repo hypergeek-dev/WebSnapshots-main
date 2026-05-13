@@ -1,0 +1,42 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 18
+VisualStudioVersion = 18.1.11312.151
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "WebSnapshots", "WebSnapshots.csproj", "{3FD30C02-CBDC-F769-E76D-A8DCE8E4A495}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Solution Items", "Solution Items", "{56EBD376-DEC4-4F84-B153-6C9B5C4A48E8}"
+	ProjectSection(SolutionItems) = preProject
+		AppRunner.cs = AppRunner.cs
+		AtomicWrite.cs = AtomicWrite.cs
+		CmsAwareNavExtractor.cs = CmsAwareNavExtractor.cs
+		CmsDetector.cs = CmsDetector.cs
+		DummyDisposable.cs = DummyDisposable.cs
+		GlobalIndexBuilder.cs = GlobalIndexBuilder.cs
+		LocalNavExtractor.cs = LocalNavExtractor.cs
+		MainForm.cs = MainForm.cs
+		MunicipalityIndexBuilder.cs = MunicipalityIndexBuilder.cs
+		PageNavModels.cs = PageNavModels.cs
+		RunManifest.cs = RunManifest.cs
+		TreePageBuilder.cs = TreePageBuilder.cs
+		UiTextWriter.cs = UiTextWriter.cs
+	EndProjectSection
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{3FD30C02-CBDC-F769-E76D-A8DCE8E4A495}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{3FD30C02-CBDC-F769-E76D-A8DCE8E4A495}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{3FD30C02-CBDC-F769-E76D-A8DCE8E4A495}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{3FD30C02-CBDC-F769-E76D-A8DCE8E4A495}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {DD4D85C8-0E6E-486C-8FD8-CDCD8DB1E724}
+	EndGlobalSection
+EndGlobal
