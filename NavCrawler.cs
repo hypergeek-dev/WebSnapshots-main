@@ -38,7 +38,7 @@ public sealed class NavCrawler
         public int MaxFallbackSectionLinks { get; set; } = 120;
     }
 
-    private sealed record QItem(string Url, int Depth, string ParentUrl, bool StructuralBranch);
+    private sealed record QItem(string Url, int Depth, string ParentUrl, bool StructuralBranch, string Text = "");
 
     public NavCrawler(SnapshotConfig cfg, PlaywrightRunner pw, Logger log)
     {
@@ -346,7 +346,7 @@ public sealed class NavCrawler
 
                     if (discovered.Add(u))
                     {
-                        q.Enqueue(new QItem(u, 1, startAbs, link.IsStructural));
+                        q.Enqueue(new QItem(u, 1, startAbs, link.IsStructural, link.Text ?? ""));
                         bestParentByUrl[u] = startAbs;
                         bestStructuralByUrl[u] = link.IsStructural;
                         fallbackSeedCount++;
@@ -498,7 +498,9 @@ public sealed class NavCrawler
             var navItem = new NavItem
             {
                 Url = item.Url,
-                Title = string.IsNullOrWhiteSpace(title) ? item.Url : title,
+                Title = !string.IsNullOrWhiteSpace(title)    ? title
+                      : !string.IsNullOrWhiteSpace(item.Text) ? item.Text
+                      : item.Url,
                 Depth = item.Depth,
                 ParentUrl = actualParent
             };
@@ -576,7 +578,7 @@ public sealed class NavCrawler
                         discovered.Add(child);
                         bestParentByUrl[child] = parentForChild;
                         bestStructuralByUrl[child] = childStructural;
-                        q.Enqueue(new QItem(child, nextDepth, parentForChild, childStructural));
+                        q.Enqueue(new QItem(child, nextDepth, parentForChild, childStructural, link.Text ?? ""));
                     }
                     else
                     {
