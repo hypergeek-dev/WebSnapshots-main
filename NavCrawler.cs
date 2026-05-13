@@ -106,7 +106,7 @@ public sealed class NavCrawler
             await SafeGotoAsync(page, startAbs, ct, pause, opt);
 
             cms = await CmsDetector.DetectAsync(page);
-            cmsExtractor = new CmsAwareNavExtractor(cms, _log);
+            cmsExtractor = new CmsAwareNavExtractor(cms, _log, startAbs);
 
             _log.Event("NAV_CMS_DETECTED",
                 ("host", host),
@@ -368,6 +368,40 @@ public sealed class NavCrawler
                 ("host", host),
                 ("primary", primaryNavUrls.Count),
                 ("visible", visibleSeedUrls.Count));
+        }
+
+        // Seed additional URLs from sitemap.xml / sitemap_index.xml / robots.txt.
+        // This is especially effective for WordPress and other CMS platforms that
+        // publish a sitemap. URLs already in the queue are deduplicated via `discovered`.
+        if (!opt.QuickPreview)
+        {
+            try
+            {
+                var sitemapUrls = await SitemapFetcher.FetchUrlsAsync(startAbs, _log);
+                var sitemapAdded = 0;
+                foreach (var su in sitemapUrls)
+                {
+                    if (allFlat.Count + q.Count >= opt.MaxPagesPerSite * 2) break;
+
+                    var u = NormalizeInternalUrl(su, startAbs, host, opt.DropQueryStrings);
+                    if (string.IsNullOrWhiteSpace(u)) continue;
+                    if (u.Equals(startAbs, StringComparison.OrdinalIgnoreCase)) continue;
+
+                    if (discovered.Add(u))
+                    {
+                        q.Enqueue(new QItem(u, 1, startAbs, false));
+                        bestParentByUrl[u] = startAbs;
+                        bestStructuralByUrl[u] = false;
+                        sitemapAdded++;
+                    }
+                }
+                if (sitemapAdded > 0)
+                    _log.Event("SITEMAP_SEEDED", ("host", host), ("added", sitemapAdded));
+            }
+            catch (Exception ex)
+            {
+                _log.Warn($"SITEMAP_SEED_WARN host={host} err={ex.Message}");
+            }
         }
 
         var depthVisited = new Dictionary<int, int>();
@@ -943,12 +977,9 @@ public sealed class NavCrawler
 
             var path = NormalizePath(u.AbsolutePath);
 
-            // Filter known crawl amplifiers / noise pages
-            if (path.Equals("/webbkarta", StringComparison.OrdinalIgnoreCase) ||
-                path.StartsWith("/webbkarta/", StringComparison.OrdinalIgnoreCase))
-            {
+            // Filter crawl amplifiers and CMS admin paths
+            if (IsNoisePath(path))
                 return null;
-            }
 
             if (!string.Equals(u.Host, host, StringComparison.OrdinalIgnoreCase))
             {
@@ -1153,6 +1184,26 @@ public sealed class NavCrawler
             path = path[..^1];
 
         return path;
+    }
+
+    private static bool IsNoisePath(string path)
+    {
+        var p = path.TrimEnd('/');
+
+        // SiteVision / Swedish municipality crawl amplifiers
+        if (p.Equals("/webbkarta", StringComparison.OrdinalIgnoreCase)) return true;
+        if (p.StartsWith("/webbkarta/", StringComparison.OrdinalIgnoreCase)) return true;
+        if (p.EndsWith("/rss", StringComparison.OrdinalIgnoreCase)) return true;
+        if (p.Contains("/nyhetsarkiv/", StringComparison.OrdinalIgnoreCase)) return true;
+        if (p.Contains("/driftinformation", StringComparison.OrdinalIgnoreCase)) return true;
+
+        // WordPress admin / system paths
+        if (p.Equals("/wp-admin", StringComparison.OrdinalIgnoreCase)) return true;
+        if (p.StartsWith("/wp-admin/", StringComparison.OrdinalIgnoreCase)) return true;
+        if (p.Equals("/wp-login.php", StringComparison.OrdinalIgnoreCase)) return true;
+        if (p.StartsWith("/wp-json/", StringComparison.OrdinalIgnoreCase)) return true;
+
+        return false;
     }
 
     private static bool SameSiteHost(string a, string b)

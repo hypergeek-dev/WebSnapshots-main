@@ -1,3 +1,4 @@
+using System.Text.RegularExpressions;
 using Microsoft.Playwright;
 
 namespace WebSnapshots;
@@ -22,109 +23,128 @@ public sealed class CmsDetectionResult
 
 public static class CmsDetector
 {
+    private static readonly Regex _generatorRx = new(
+        @"<meta\s[^>]*name=[""']generator[""'][^>]*content=[""']([^""']+)[""']|" +
+        @"<meta\s[^>]*content=[""']([^""']+)[""'][^>]*name=[""']generator[""']",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
     public static async Task<CmsDetectionResult> DetectAsync(IPage page)
     {
         var html = await page.ContentAsync();
         var lower = html.ToLowerInvariant();
 
-        var signals = new List<string>();
-
         bool Has(string s) => lower.Contains(s, StringComparison.Ordinal);
 
-        if (Has("/sitevision/")) signals.Add("/sitevision/");
-        if (Has("svdocready")) signals.Add("svDocReady");
-        if (Has("appregistry")) signals.Add("AppRegistry");
-        if (Has("sv-template-")) signals.Add("sv-template-*");
-        if (Has("sv-portlet")) signals.Add("sv-portlet");
-        if (Has("class=\"sv-") || Has(" class=\"sv-")) signals.Add("sv-* classes");
+        // Meta generator tag gives a reliable single-signal identification
+        var generatorContent = "";
+        var genMatch = _generatorRx.Match(html);
+        if (genMatch.Success)
+            generatorContent = (genMatch.Groups[1].Value + genMatch.Groups[2].Value).ToLowerInvariant();
 
-        if (signals.Count >= 2)
-        {
-            return new CmsDetectionResult
-            {
-                Kind = CmsKind.SiteVision,
-                Confidence = signals.Count >= 4 ? "high" : "medium",
-                Signals = signals
-            };
-        }
+        // ── WordPress ─────────────────────────────────────────────────────────
+        // Require path-based signals or generator tag — never fire on "wp-" alone.
+        var wpSignals = new List<string>();
+        if (Has("/wp-content/"))  wpSignals.Add("/wp-content/");
+        if (Has("/wp-includes/")) wpSignals.Add("/wp-includes/");
+        if (Has("wp-json"))       wpSignals.Add("wp-json");
+        if (generatorContent.Contains("wordpress")) wpSignals.Add("meta:generator=WordPress");
 
-        signals = new List<string>();
-        if (Has("/wp-content/")) signals.Add("/wp-content/");
-        if (Has("/wp-includes/")) signals.Add("/wp-includes/");
-        if (Has("wp-json")) signals.Add("wp-json");
-        if (Has("wp-")) signals.Add("wp-*");
-
-        if (signals.Count >= 2)
+        if (wpSignals.Count >= 1)
         {
             return new CmsDetectionResult
             {
                 Kind = CmsKind.WordPress,
-                Confidence = signals.Count >= 3 ? "high" : "medium",
-                Signals = signals
+                Confidence = wpSignals.Count >= 2 ? "high" : "medium",
+                Signals = wpSignals
             };
         }
 
-        signals = new List<string>();
-        if (Has("drupalsettings")) signals.Add("drupalSettings");
-        if (Has("drupal.settings")) signals.Add("Drupal.settings");
-        if (Has("/sites/default/files/")) signals.Add("/sites/default/files/");
-        if (Has("block-")) signals.Add("block-*");
-        if (Has("region-")) signals.Add("region-*");
+        // ── SiteVision ────────────────────────────────────────────────────────
+        var svSignals = new List<string>();
+        if (Has("/sitevision/"))                           svSignals.Add("/sitevision/");
+        if (Has("svdocready"))                             svSignals.Add("svDocReady");
+        if (Has("appregistry"))                            svSignals.Add("AppRegistry");
+        if (Has("sv-template-"))                           svSignals.Add("sv-template-*");
+        if (Has("sv-portlet"))                             svSignals.Add("sv-portlet");
+        if (Has("class=\"sv-") || Has(" class=\"sv-"))    svSignals.Add("sv-* classes");
 
-        if (signals.Count >= 2)
+        if (svSignals.Count >= 2)
+        {
+            return new CmsDetectionResult
+            {
+                Kind = CmsKind.SiteVision,
+                Confidence = svSignals.Count >= 4 ? "high" : "medium",
+                Signals = svSignals
+            };
+        }
+
+        // ── Drupal ────────────────────────────────────────────────────────────
+        // Only use signals specific enough not to appear on non-Drupal sites.
+        var drupalSignals = new List<string>();
+        if (Has("drupalsettings"))          drupalSignals.Add("drupalSettings");
+        if (Has("drupal.settings"))         drupalSignals.Add("Drupal.settings");
+        if (Has("/sites/default/files/"))   drupalSignals.Add("/sites/default/files/");
+        if (Has("data-drupal-"))            drupalSignals.Add("data-drupal-*");
+        if (generatorContent.Contains("drupal")) drupalSignals.Add("meta:generator=Drupal");
+
+        if (drupalSignals.Count >= 1)
         {
             return new CmsDetectionResult
             {
                 Kind = CmsKind.Drupal,
-                Confidence = signals.Count >= 3 ? "high" : "medium",
-                Signals = signals
+                Confidence = drupalSignals.Count >= 2 ? "high" : "medium",
+                Signals = drupalSignals
             };
         }
 
-        signals = new List<string>();
-        if (Has("/umbraco/")) signals.Add("/umbraco/");
-        if (Has("umbraco")) signals.Add("umbraco");
-        if (Has("uSkinned".ToLowerInvariant())) signals.Add("uSkinned");
-        if (Has("umb-")) signals.Add("umb-*");
+        // ── Umbraco ───────────────────────────────────────────────────────────
+        var umbracoSignals = new List<string>();
+        if (Has("/umbraco/"))                       umbracoSignals.Add("/umbraco/");
+        if (Has("umbraco"))                         umbracoSignals.Add("umbraco");
+        if (Has("uskinned"))                        umbracoSignals.Add("uSkinned");
+        if (Has("umb-"))                            umbracoSignals.Add("umb-*");
+        if (generatorContent.Contains("umbraco"))   umbracoSignals.Add("meta:generator=Umbraco");
 
-        if (signals.Count >= 2)
+        if (umbracoSignals.Count >= 2)
         {
             return new CmsDetectionResult
             {
                 Kind = CmsKind.Umbraco,
-                Confidence = signals.Count >= 3 ? "high" : "medium",
-                Signals = signals
+                Confidence = umbracoSignals.Count >= 3 ? "high" : "medium",
+                Signals = umbracoSignals
             };
         }
 
-        signals = new List<string>();
-        if (Has("episerver")) signals.Add("episerver");
-        if (Has("optimizely")) signals.Add("optimizely");
-        if (Has("data-epi")) signals.Add("data-epi*");
-        if (Has(" epi-")) signals.Add("epi-*");
+        // ── Optimizely (EPiServer) ────────────────────────────────────────────
+        var epiSignals = new List<string>();
+        if (Has("episerver"))   epiSignals.Add("episerver");
+        if (Has("optimizely"))  epiSignals.Add("optimizely");
+        if (Has("data-epi"))    epiSignals.Add("data-epi*");
+        if (Has(" epi-"))       epiSignals.Add("epi-*");
 
-        if (signals.Count >= 2)
+        if (epiSignals.Count >= 2)
         {
             return new CmsDetectionResult
             {
                 Kind = CmsKind.Optimizely,
-                Confidence = signals.Count >= 3 ? "high" : "medium",
-                Signals = signals
+                Confidence = epiSignals.Count >= 3 ? "high" : "medium",
+                Signals = epiSignals
             };
         }
 
-        signals = new List<string>();
-        if (Has("/sitecore/")) signals.Add("/sitecore/");
-        if (Has("sitecore")) signals.Add("sitecore");
-        if (Has(" sc-")) signals.Add("sc-*");
+        // ── Sitecore ──────────────────────────────────────────────────────────
+        var scSignals = new List<string>();
+        if (Has("/sitecore/"))  scSignals.Add("/sitecore/");
+        if (Has("sitecore"))    scSignals.Add("sitecore");
+        if (Has(" sc-"))        scSignals.Add("sc-*");
 
-        if (signals.Count >= 2)
+        if (scSignals.Count >= 2)
         {
             return new CmsDetectionResult
             {
                 Kind = CmsKind.Sitecore,
-                Confidence = signals.Count >= 3 ? "high" : "medium",
-                Signals = signals
+                Confidence = scSignals.Count >= 3 ? "high" : "medium",
+                Signals = scSignals
             };
         }
 

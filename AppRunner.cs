@@ -147,7 +147,7 @@ public static class AppRunner
         var municipality = Utils.HostToMunicipality(host);
 
         // Scrape folder: {OutputDir}/{Municipality}/{YYMMDDHHmm}
-        var scrapeFolderName = DateTimeOffset.Now.ToString("yyMMddHHmm", CultureInfo.InvariantCulture);
+        var scrapeFolderName = DateTimeOffset.Now.ToString("yyMMdd", CultureInfo.InvariantCulture);
         var scrapeRootDir = Path.Combine(cfg.OutputDir, municipality, scrapeFolderName);
 
         // Deduplicate if folder already exists (rare but possible)

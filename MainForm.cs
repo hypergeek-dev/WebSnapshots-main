@@ -144,7 +144,7 @@ public sealed class MainForm : Form
 
         // Landing page only checkbox
         var rowLanding = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = false };
-        _landingOnly.Text = "Landing page only (For testing)";
+        _landingOnly.Text = "Landing page only";
         _landingOnly.AutoSize = true;
         _landingOnly.Padding = new Padding(0, 4, 0, 4);
         rowLanding.Controls.Add(_landingOnly);
@@ -152,7 +152,7 @@ public sealed class MainForm : Form
 
         // Quick preview mode (fast tree test)
         var rowPreview = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = true };
-        _quickPreview.Text = "Quick preview (fast tree test)";
+        _quickPreview.Text = "Quick preview";
         _quickPreview.AutoSize = true;
         _quickPreview.Padding = new Padding(0, 4, 8, 4);
         rowPreview.Controls.Add(_quickPreview);

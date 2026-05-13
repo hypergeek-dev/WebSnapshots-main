@@ -7,11 +7,17 @@ public sealed class CmsAwareNavExtractor
 {
     private readonly CmsDetectionResult _cms;
     private readonly Logger? _log;
+    private readonly string _startUrl;
 
-    public CmsAwareNavExtractor(CmsDetectionResult cms, Logger? log = null)
+    // Track which pages have already had human-like preparation run so we
+    // don't repeat the click/hover/scroll pass on the same IPage instance.
+    private readonly HashSet<IPage> _preparedPages = new(ReferenceEqualityComparer.Instance);
+
+    public CmsAwareNavExtractor(CmsDetectionResult cms, Logger? log = null, string startUrl = "")
     {
         _cms = cms;
         _log = log;
+        _startUrl = startUrl;
     }
 
     public async Task<List<NavGroup>> ExtractStartPageNavGroupsAsync(
@@ -24,6 +30,27 @@ public sealed class CmsAwareNavExtractor
         await PreparePageForHumanLikeExtractionAsync(page);
 
         var groups = new List<NavGroup>();
+
+        if (_cms.Kind == CmsKind.WordPress)
+        {
+            var wpNav = await ExtractWordPressNavAsync(page, pageUrl, host, dropQueryStrings, maxLinks);
+            if (wpNav.Count > 0)
+            {
+                groups.Add(new NavGroup
+                {
+                    Id = "startpage_wp_nav",
+                    Rank = 0,
+                    LinkCount = wpNav.Count,
+                    Flat = wpNav.Select(x => new NavItem
+                    {
+                        Url = x.Url,
+                        Title = x.Text,
+                        Depth = 1,
+                        ParentUrl = pageUrl
+                    }).ToList()
+                });
+            }
+        }
 
         if (_cms.Kind == CmsKind.SiteVision)
         {
@@ -123,6 +150,7 @@ public sealed class CmsAwareNavExtractor
         return _cms.Kind switch
         {
             CmsKind.SiteVision => await ExtractSiteVisionVisibleGroupsAsync(page, pageUrl, host, dropQueryStrings, maxPerGroup),
+            CmsKind.WordPress  => await ExtractWordPressVisibleGroupsAsync(page, pageUrl, host, dropQueryStrings, maxPerGroup),
             _ => await ExtractGenericVisibleGroupsAsync(page, pageUrl, host, dropQueryStrings, maxPerGroup)
         };
     }
@@ -259,13 +287,22 @@ public sealed class CmsAwareNavExtractor
         return result;
     }
 
-    private static bool IsStartPage(string pageUrl)
+    private bool IsStartPage(string pageUrl)
     {
+        // Match the configured start URL regardless of path depth.
+        if (!string.IsNullOrEmpty(_startUrl) &&
+            pageUrl.Equals(_startUrl, StringComparison.OrdinalIgnoreCase))
+            return true;
+
         try
         {
             var u = new Uri(pageUrl);
             var path = (u.AbsolutePath ?? "").Trim('/');
-            return string.IsNullOrWhiteSpace(path);
+            // Also treat /index.html and /index.php as start-page equivalents.
+            return string.IsNullOrWhiteSpace(path)
+                || path.Equals("index.html", StringComparison.OrdinalIgnoreCase)
+                || path.Equals("index.php", StringComparison.OrdinalIgnoreCase)
+                || path.Equals("index.htm", StringComparison.OrdinalIgnoreCase);
         }
         catch
         {
@@ -275,6 +312,10 @@ public sealed class CmsAwareNavExtractor
 
     private async Task PreparePageForHumanLikeExtractionAsync(IPage page)
     {
+        // Skip if this page instance has already been prepared in this extraction session.
+        if (!_preparedPages.Add(page))
+            return;
+
         try
         {
             await page.EvaluateAsync(@"
@@ -1464,14 +1505,8 @@ async () => {
 
             var path = (u.AbsolutePath ?? "").TrimEnd('/');
 
-            if (path.Equals("/webbkarta", StringComparison.OrdinalIgnoreCase) ||
-                path.StartsWith("/webbkarta/", StringComparison.OrdinalIgnoreCase) ||
-                path.EndsWith("/rss", StringComparison.OrdinalIgnoreCase) ||
-                path.Contains("/nyhetsarkiv/", StringComparison.OrdinalIgnoreCase) ||
-                path.Contains("/driftinformation", StringComparison.OrdinalIgnoreCase))
-            {
+            if (IsNoisePath(path))
                 return null;
-            }
 
             if (!string.Equals(u.Host, host, StringComparison.OrdinalIgnoreCase))
             {
@@ -1485,6 +1520,207 @@ async () => {
         {
             return null;
         }
+    }
+
+    // Single authoritative noise-path filter used by both C# and as a replacement
+    // for the previously duplicated inline JS isNoisePath function.
+    private static bool IsNoisePath(string path)
+    {
+        var p = path.TrimEnd('/');
+
+        // SiteVision / Swedish municipality noise
+        if (p.Equals("/webbkarta", StringComparison.OrdinalIgnoreCase)) return true;
+        if (p.StartsWith("/webbkarta/", StringComparison.OrdinalIgnoreCase)) return true;
+        if (p.EndsWith("/rss", StringComparison.OrdinalIgnoreCase)) return true;
+        if (p.Contains("/nyhetsarkiv/", StringComparison.OrdinalIgnoreCase)) return true;
+        if (p.Contains("/driftinformation", StringComparison.OrdinalIgnoreCase)) return true;
+
+        // WordPress admin / system paths — never worth archiving
+        if (p.Equals("/wp-admin", StringComparison.OrdinalIgnoreCase)) return true;
+        if (p.StartsWith("/wp-admin/", StringComparison.OrdinalIgnoreCase)) return true;
+        if (p.Equals("/wp-login.php", StringComparison.OrdinalIgnoreCase)) return true;
+        if (p.StartsWith("/wp-json/", StringComparison.OrdinalIgnoreCase)) return true;
+
+        return false;
+    }
+
+    // ── WordPress extraction ──────────────────────────────────────────────────
+
+    // Tries the WordPress REST API first (wp-json/wp/v2/pages), then falls back
+    // to DOM-based extraction using WordPress-specific nav selectors.
+    private async Task<List<PageNavLink>> ExtractWordPressNavAsync(
+        IPage page,
+        string pageUrl,
+        string host,
+        bool dropQueryStrings,
+        int maxLinks)
+    {
+        // REST API attempt — runs inside the browser so session cookies apply.
+        var restResults = await page.EvaluateAsync<JsonElement>(@"
+async () => {
+  const base = document.location.origin;
+  const results = [];
+  const seen = new Set();
+
+  const addResult = (url, text, confidence) => {
+    if (!url || seen.has(url)) return;
+    seen.add(url);
+    results.push({ url, text: (text || url).replace(/\s+/g, ' ').trim(), confidence,
+      kind: 'wp-nav', sourceType: 'WordPress', displayRole: 'Navigation',
+      groupLabel: 'Main navigation', isStructural: true });
+  };
+
+  // Try WP Menu API (WP 5.9+ or WP REST API menus plugin)
+  try {
+    const menusResp = await fetch(base + '/wp-json/menus/v1/menus',
+      { headers: { Accept: 'application/json' } });
+    if (menusResp.ok) {
+      const menus = await menusResp.json();
+      if (Array.isArray(menus) && menus.length > 0) {
+        const primary = menus.find(m =>
+          /primary|main|header|nav/i.test((m.slug || '') + (m.name || ''))
+        ) || menus[0];
+        const itemsResp = await fetch(
+          base + '/wp-json/menus/v1/menus/' + primary.slug + '/items',
+          { headers: { Accept: 'application/json' } });
+        if (itemsResp.ok) {
+          const items = await itemsResp.json();
+          if (Array.isArray(items)) {
+            for (const item of items.sort((a,b) => (a.menu_order||0)-(b.menu_order||0)))
+              addResult(item.url, item.title, 0.99);
+          }
+        }
+        if (results.length > 0) return results;
+      }
+    }
+  } catch {}
+
+  // Try WP pages REST endpoint (always available on self-hosted WP)
+  try {
+    const resp = await fetch(
+      base + '/wp-json/wp/v2/pages?per_page=100&_fields=id,link,parent,title,menu_order,status&status=publish',
+      { headers: { Accept: 'application/json' } });
+    if (resp.ok) {
+      const pages = await resp.json();
+      if (Array.isArray(pages) && pages.length > 0) {
+        for (const p of pages.sort((a,b) => (a.menu_order||0)-(b.menu_order||0)))
+          addResult(p.link, p.title && p.title.rendered, 0.95);
+        return results;
+      }
+    }
+  } catch {}
+
+  return results;
+}
+");
+
+        var restLinks = ParsePageNavLinks(restResults, host, dropQueryStrings, maxLinks);
+        if (restLinks.Count > 0)
+        {
+            _log?.Event("WP_REST_NAV", ("url", pageUrl), ("count", restLinks.Count));
+            return restLinks;
+        }
+
+        // DOM fallback — WordPress-specific nav selectors scored by specificity.
+        var domRaw = await page.EvaluateAsync<JsonElement>(@"
+() => {
+  const seen = new Map();
+  const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+
+  const isBad = href => {
+    const h = (href || '').trim().toLowerCase();
+    return !h || h === '#' || h.startsWith('#') ||
+           h.startsWith('javascript:') || h.startsWith('mailto:') || h.startsWith('tel:');
+  };
+
+  const isVisible = el => {
+    try {
+      const cs = window.getComputedStyle(el);
+      if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') return false;
+      const r = el.getBoundingClientRect();
+      return r.width >= 2 && r.height >= 2;
+    } catch { return false; }
+  };
+
+  // Ordered from most specific (WordPress theme defaults) to generic fallbacks
+  const selectors = [
+    { sel: '.wp-block-navigation a[href]',        score: 0.97 },
+    { sel: 'nav.main-navigation a[href]',          score: 0.96 },
+    { sel: 'nav#site-navigation a[href]',          score: 0.96 },
+    { sel: '#main-navigation a[href]',             score: 0.95 },
+    { sel: '.primary-navigation a[href]',          score: 0.95 },
+    { sel: '#primary-menu a[href]',                score: 0.94 },
+    { sel: '.nav-primary a[href]',                 score: 0.94 },
+    { sel: 'ul.menu a[href]',                      score: 0.90 },
+    { sel: '.menu-main-menu-container a[href]',    score: 0.90 },
+    { sel: 'header nav a[href]',                   score: 0.87 },
+  ];
+
+  for (const { sel, score } of selectors) {
+    let nodes;
+    try { nodes = Array.from(document.querySelectorAll(sel)); } catch { continue; }
+    let visibleCount = 0;
+    for (const a of nodes) {
+      const href = (a.getAttribute('href') || '').trim();
+      if (isBad(href)) continue;
+      if (!isVisible(a)) continue;
+      visibleCount++;
+      let abs;
+      try { abs = new URL(href, document.location.href).toString(); } catch { continue; }
+      const text = norm(a.innerText || a.textContent || a.getAttribute('aria-label') || href);
+      const existing = seen.get(abs);
+      if (!existing || score > existing.confidence)
+        seen.set(abs, { url: abs, text, confidence: score,
+          kind: 'wp-dom', sourceType: 'WordPress', displayRole: 'Navigation',
+          groupLabel: 'Main navigation', isStructural: true });
+    }
+    // Stop at first selector that yields at least 3 visible links
+    if (visibleCount >= 3) break;
+  }
+
+  return Array.from(seen.values()).sort((a,b) => b.confidence - a.confidence);
+}
+");
+
+        var domLinks = ParsePageNavLinks(domRaw, host, dropQueryStrings, maxLinks);
+        if (domLinks.Count > 0)
+            _log?.Event("WP_DOM_NAV", ("url", pageUrl), ("count", domLinks.Count));
+
+        return domLinks;
+    }
+
+    private async Task<List<VisibleLinkGroup>> ExtractWordPressVisibleGroupsAsync(
+        IPage page,
+        string pageUrl,
+        string host,
+        bool dropQueryStrings,
+        int maxPerGroup)
+    {
+        var groups = new List<VisibleLinkGroup>();
+
+        // Recent posts / news widget (common in sidebars and footers)
+        var recentPosts = await ExtractGroupBySelectorAsync(
+            page, pageUrl, host, dropQueryStrings,
+            ".widget_recent_entries a[href], .wp-block-latest-posts a[href], " +
+            ".recent-posts a[href], #recent-posts-widget a[href]",
+            "wp_recent_posts", "Recent posts", "News", 20, maxPerGroup);
+        if (recentPosts.Flat.Count > 0) groups.Add(recentPosts);
+
+        // Category links
+        var categories = await ExtractGroupBySelectorAsync(
+            page, pageUrl, host, dropQueryStrings,
+            ".widget_categories a[href], .wp-block-categories a[href]",
+            "wp_categories", "Categories", "Navigation", 30, maxPerGroup);
+        if (categories.Flat.Count > 0) groups.Add(categories);
+
+        // Footer links
+        var footer = await ExtractGroupBySelectorAsync(
+            page, pageUrl, host, dropQueryStrings,
+            "footer a[href]",
+            "footer", "Footer", "FooterLinks", 60, maxPerGroup);
+        if (footer.Flat.Count > 0) groups.Add(footer);
+
+        return groups.OrderBy(x => x.Order).ToList();
     }
 
     private static bool SameSiteHost(string a, string b)
