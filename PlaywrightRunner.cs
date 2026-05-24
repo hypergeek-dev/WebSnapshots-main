@@ -27,9 +27,22 @@ public sealed class PlaywrightRunner : IAsyncDisposable
 
             if (_browser == null)
             {
+                // PLAYWRIGHT_CHROMIUM_SHELL lets the host override the headless-shell path.
+                // Useful when the default Playwright revision is broken on a specific machine.
+                var shellOverride = Environment.GetEnvironmentVariable("PLAYWRIGHT_CHROMIUM_SHELL")?.Trim();
+                var execPath = shellOverride is { Length: > 0 } && File.Exists(shellOverride) ? shellOverride : null;
+
+                if (execPath != null)
+                    _log?.Info($"[PLAYWRIGHT] Using Chromium shell override: {execPath}");
+                else if (!string.IsNullOrWhiteSpace(shellOverride))
+                    _log?.Warn($"[PLAYWRIGHT] Ignoring PLAYWRIGHT_CHROMIUM_SHELL because the file was not found: {shellOverride}");
+                else
+                    _log?.Info("[PLAYWRIGHT] Using Playwright default Chromium executable.");
+
                 _browser = await _playwright.Chromium.LaunchAsync(new BrowserTypeLaunchOptions
                 {
                     Headless = true,
+                    ExecutablePath = execPath,
                     Args = new[]
                     {
                         "--disable-gpu",
