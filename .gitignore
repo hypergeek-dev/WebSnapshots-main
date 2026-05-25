@@ -113,6 +113,9 @@ StyleCopReport.xml
 *.svclog
 *.scc
 
+# WebSnapshots generated diagnostic/crawl outputs
+diagnostics*/
+
 # Chutzpah Test files
 _Chutzpah*
 

@@ -1,0 +1,74 @@
+{
+  "targets": [
+    {
+      "id": "sitevision_ystad",
+      "name": "Ystad kommun",
+      "cms": "SiteVision",
+      "url": "https://ystad.se/",
+      "purpose": "Baseline Swedish municipal Sitevision crawl"
+    },
+    {
+      "id": "sitevision_kristianstad",
+      "name": "Kristianstad kommun",
+      "cms": "SiteVision",
+      "url": "https://www.kristianstad.se/",
+      "purpose": "Larger modern Swedish Sitevision crawl"
+    },
+    {
+      "id": "wordpress_municipio_eslov",
+      "name": "Eslövs kommun",
+      "cms": "WordPress",
+      "url": "https://eslov.se/",
+      "purpose": "Baseline Swedish municipal WordPress/Municipio crawl"
+    },
+    {
+      "id": "wordpress_municipio_staffanstorp",
+      "name": "Staffanstorps kommun",
+      "cms": "WordPress",
+      "url": "https://staffanstorp.se/",
+      "purpose": "Alternate Swedish municipal WordPress/Municipio crawl"
+    },
+    {
+      "id": "umbraco_sorsele",
+      "name": "Sorsele kommun",
+      "cms": "Umbraco",
+      "url": "https://www.sorsele.se/kommun/",
+      "purpose": "Swedish municipal Umbraco crawl using the municipality information root, not the portal/news front"
+    },
+    {
+      "id": "umbraco_asele",
+      "name": "Åsele kommun",
+      "cms": "Umbraco",
+      "url": "https://www.asele.se/",
+      "purpose": "Alternate Swedish municipal Umbraco crawl"
+    },
+    {
+      "id": "optimizely_partille",
+      "name": "Partille kommun",
+      "cms": "Optimizely",
+      "url": "https://www.partille.se/",
+      "purpose": "Baseline Swedish municipal Optimizely/Episerver crawl — confirmed on Optimizely DXCloud"
+    },
+    {
+      "id": "optimizely_haninge",
+      "name": "Haninge kommun",
+      "cms": "Optimizely",
+      "url": "https://www.haninge.se/",
+      "purpose": "Alternate Swedish municipal Optimizely/Episerver crawl"
+    },
+    {
+      "id": "drupal_mucf",
+      "name": "MUCF",
+      "cms": "Drupal",
+      "url": "https://www.mucf.se/",
+      "purpose": "Swedish public-sector Drupal crawl"
+    },
+    {
+      "id": "acos_namsos",
+      "name": "Namsos kommune",
+      "cms": "Unknown",
+      "url": "https://namsos.kommune.no/",
+      "purpose": "Norwegian municipal ACOS crawl (CMS to be verified by detector)"
+    }
+  ]
+}

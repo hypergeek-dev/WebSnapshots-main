@@ -1,0 +1,79 @@
+{
+  "profiles": [
+    {
+      "name": "smoke",
+      "maxDepth": 0,
+      "maxPages": 1,
+      "maxChildrenPerPage": 0,
+      "maxPagesPerDepth": 0,
+      "captureSnapshots": false,
+      "extractText": false,
+      "buildViewer": false,
+      "telemetry": true,
+      "qualityReport": true,
+      "stopWhenSaturated": false,
+      "saturationWindowSize": 10,
+      "description": "Verify basic pipeline wiring. No crawl beyond start page."
+    },
+    {
+      "name": "cms-diagnostic",
+      "maxDepth": 1,
+      "maxPages": 50,
+      "maxChildrenPerPage": 15,
+      "maxPagesPerDepth": 50,
+      "captureSnapshots": false,
+      "extractText": true,
+      "buildViewer": true,
+      "telemetry": true,
+      "qualityReport": true,
+      "stopWhenSaturated": false,
+      "saturationWindowSize": 20,
+      "description": "Check CMS detection and basic start-page navigation discovery."
+    },
+    {
+      "name": "nav-diagnostic",
+      "maxDepth": 3,
+      "maxPages": 200,
+      "maxChildrenPerPage": 20,
+      "maxPagesPerDepth": 70,
+      "captureSnapshots": false,
+      "extractText": true,
+      "buildViewer": true,
+      "telemetry": true,
+      "qualityReport": true,
+      "stopWhenSaturated": false,
+      "saturationWindowSize": 50,
+      "description": "Main feedback-loop mode for improving navigation extraction and tree quality."
+    },
+    {
+      "name": "snapshot-diagnostic",
+      "maxDepth": 2,
+      "maxPages": 40,
+      "maxChildrenPerPage": 10,
+      "maxPagesPerDepth": 30,
+      "captureSnapshots": true,
+      "extractText": true,
+      "buildViewer": true,
+      "telemetry": true,
+      "qualityReport": true,
+      "stopWhenSaturated": false,
+      "saturationWindowSize": 20,
+      "description": "Small representative run for snapshot and text extraction problems."
+    },
+    {
+      "name": "full-validation",
+      "maxDepth": 3,
+      "maxPages": 1500,
+      "maxChildrenPerPage": 0,
+      "maxPagesPerDepth": 0,
+      "captureSnapshots": true,
+      "extractText": true,
+      "buildViewer": true,
+      "telemetry": true,
+      "qualityReport": true,
+      "stopWhenSaturated": false,
+      "saturationWindowSize": 100,
+      "description": "Final confidence check after a candidate improvement looks good."
+    }
+  ]
+}

@@ -3,6 +3,7 @@ using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.Formats.Webp;
 using System.Text;
 using System.Text.Json;
+using WebSnapshots.Telemetry;
 using Img = SixLabors.ImageSharp.Image;
 
 namespace WebSnapshots;
@@ -17,14 +18,22 @@ public sealed class Snapshotter
     private readonly SnapshotConfig _cfg;
     private readonly PlaywrightRunner _runner;
     private readonly Logger? _log;
+    private readonly TelemetryWriter? _telemetry;
+    private readonly bool _skipScreenshots;
 
-    public Snapshotter(SnapshotConfig cfg, PlaywrightRunner runner) : this(cfg, runner, null) { }
+    public Snapshotter(SnapshotConfig cfg, PlaywrightRunner runner) : this(cfg, runner, null, null, false) { }
 
-    public Snapshotter(SnapshotConfig cfg, PlaywrightRunner runner, Logger? log)
+    public Snapshotter(SnapshotConfig cfg, PlaywrightRunner runner, Logger? log) : this(cfg, runner, log, null, false) { }
+
+    public Snapshotter(SnapshotConfig cfg, PlaywrightRunner runner, Logger? log, TelemetryWriter? telemetry) : this(cfg, runner, log, telemetry, false) { }
+
+    public Snapshotter(SnapshotConfig cfg, PlaywrightRunner runner, Logger? log, TelemetryWriter? telemetry, bool skipScreenshots)
     {
         _cfg = cfg;
         _runner = runner;
         _log = log;
+        _telemetry = telemetry;
+        _skipScreenshots = skipScreenshots;
     }
 
     public Task<int> CaptureAllAsync(string siteDir, List<NavItem> flat, StorageGovernor governor)
@@ -194,14 +203,27 @@ public sealed class Snapshotter
                     TextContent textContent;
                     using (_log?.Scope("TEXT_EXTRACT", ("url", url)) ?? DummyDisposable.Instance)
                     {
-                        textContent = await textExtractor.ExtractAsync(page, url);
-                        _log?.Event("TEXT_EXTRACTED", ("url", url), ("sections", textContent.Sections.Count), ("links", textContent.Links.Count));
+                        try
+                        {
+                            textContent = await textExtractor.ExtractAsync(page, url);
+                            _log?.Event("TEXT_EXTRACTED", ("url", url), ("sections", textContent.Sections.Count), ("links", textContent.Links.Count));
+                            _telemetry?.Emit(TelemetryPhase.TextExtract, "text_extracted", TelemetrySeverity.Info,
+                                url, new Dictionary<string, object?>
+                                {
+                                    ["titleLength"] = textContent.Title?.Length ?? 0,
+                                    ["descriptionLength"] = textContent.Description?.Length ?? 0,
+                                    ["sectionCount"] = textContent.Sections.Count,
+                                    ["linkCount"] = textContent.Links.Count
+                                });
+                        }
+                        catch (Exception texEx)
+                        {
+                            _log?.Warn($"TEXT_EXTRACT_FAIL url={url} err={texEx.Message}");
+                            _telemetry?.Emit(TelemetryPhase.TextExtract, "text_extract_fail", TelemetrySeverity.Warning,
+                                url, new Dictionary<string, object?> { ["errorKind"] = texEx.GetType().Name });
+                            textContent = new TextContent { Title = it.Title ?? "", Url = url };
+                        }
                     }
-
-                    ct.ThrowIfCancellationRequested();
-                    pause.WaitIfPaused(ct);
-
-                    await EnhanceForSnapshotAsync(page);
 
                     ct.ThrowIfCancellationRequested();
                     pause.WaitIfPaused(ct);
@@ -209,15 +231,27 @@ public sealed class Snapshotter
                     List<string> images;
                     bool usedSingle = false;
 
-                    try
+                    if (!_skipScreenshots)
                     {
-                        images = await CaptureSingleAsWebpAsync(page, shotsDir, safeBase, governor, ct, pause);
-                        usedSingle = true;
+                        await EnhanceForSnapshotAsync(page);
+
+                        ct.ThrowIfCancellationRequested();
+                        pause.WaitIfPaused(ct);
+
+                        try
+                        {
+                            images = await CaptureSingleAsWebpAsync(page, shotsDir, safeBase, governor, ct, pause);
+                            usedSingle = true;
+                        }
+                        catch (Exception exSingle)
+                        {
+                            _log?.Warn($"SHOT_SINGLE_FAIL url={url} err={exSingle.Message}");
+                            images = await CaptureTilesAsWebpAsync(page, shotsDir, safeBase, governor, ct, pause);
+                        }
                     }
-                    catch (Exception exSingle)
+                    else
                     {
-                        _log?.Warn($"SHOT_SINGLE_FAIL url={url} err={exSingle.Message}");
-                        images = await CaptureTilesAsWebpAsync(page, shotsDir, safeBase, governor, ct, pause);
+                        images = new List<string>();
                     }
 
                     ct.ThrowIfCancellationRequested();
@@ -260,6 +294,14 @@ public sealed class Snapshotter
                         ("page", outHtml),
                         ("textPage", outTextHtml));
 
+                    _telemetry?.Emit(TelemetryPhase.Snapshot, "snapshot_success", TelemetrySeverity.Info,
+                        url, new Dictionary<string, object?>
+                        {
+                            ["imageCount"] = images.Count,
+                            ["mode"] = _skipScreenshots ? "text-only" : (usedSingle ? "single" : "tiled"),
+                            ["index"] = capturedPages + 1
+                        });
+
                     capturedPages++;
 
                     if (_cfg.DelayBetweenPagesMs > 0)
@@ -280,6 +322,12 @@ public sealed class Snapshotter
             {
                 _log?.Error($"SHOT_FAIL url={url} err={ex}");
                 Console.WriteLine($"[SHOT] warn {url}: {ex.Message}");
+                _telemetry?.Emit(TelemetryPhase.Snapshot, "snapshot_fail", TelemetrySeverity.Warning,
+                    url, new Dictionary<string, object?>
+                    {
+                        ["errorKind"] = ex is TimeoutException ? "timeout" : ex.GetType().Name,
+                        ["error"] = ex.Message
+                    });
 
                 var stub = PageHtmlBuilder.Build(
                     title: $"FAILED: {it.Title}",

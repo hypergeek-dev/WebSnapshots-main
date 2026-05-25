@@ -3,6 +3,8 @@ using System.Collections.Concurrent;
 using System.Globalization;
 using System.Text;
 using System.Text.Json;
+using WebSnapshots.Analysis;
+using WebSnapshots.Diagnostic;
 
 namespace WebSnapshots;
 
@@ -31,6 +33,34 @@ public static class Program
         if (args[0].Equals("serve", StringComparison.OrdinalIgnoreCase))
         {
             await RunServeAsync(args);
+            return;
+        }
+
+        // Diagnostic mode: run scraper against a known CMS target with telemetry
+        if (args[0].Equals("diagnostic", StringComparison.OrdinalIgnoreCase))
+        {
+            await RunDiagnosticAsync(args);
+            return;
+        }
+
+        // Compare two scrape folders for the same target
+        if (args[0].Equals("compare", StringComparison.OrdinalIgnoreCase))
+        {
+            await RunCompareAsync(args);
+            return;
+        }
+
+        // Build an AI review pack from a scrape folder
+        if (args[0].Equals("review-pack", StringComparison.OrdinalIgnoreCase))
+        {
+            await RunReviewPackAsync(args);
+            return;
+        }
+
+        // Run the acceptance gate against a comparison report
+        if (args[0].Equals("acceptance", StringComparison.OrdinalIgnoreCase))
+        {
+            await RunAcceptanceAsync(args);
             return;
         }
 
@@ -368,6 +398,222 @@ public static class Program
             .Cast<string>()
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
+    }
+
+    // ── Diagnostic commands ──────────────────────────────────────────────────
+
+    /// <summary>
+    /// dotnet run -- diagnostic --target sitevision_ystad [--profile nav-diagnostic]
+    ///              [--output ./diagnostics] [--max-depth 3] [--max-pages 200]
+    ///              [--config path/to/cms-targets.json]
+    /// </summary>
+    private static async Task RunDiagnosticAsync(string[] args)
+    {
+        var targetId = GetArg(args, "--target") ?? GetArg(args, "-t");
+        if (string.IsNullOrWhiteSpace(targetId))
+        {
+            Console.Error.WriteLine("Usage: dotnet run -- diagnostic --target <targetId> [--profile <profile>] [--output ./diagnostics]");
+            Console.Error.WriteLine("       dotnet run -- diagnostic --target sitevision_ystad --profile smoke");
+            Console.Error.WriteLine("Profiles: smoke, cms-diagnostic, nav-diagnostic, snapshot-diagnostic, full-validation");
+            ListTargets();
+            return;
+        }
+
+        var outputDir = GetArg(args, "--output") ?? GetArg(args, "--out") ?? "./diagnostics";
+        outputDir = Path.GetFullPath(outputDir);
+
+        var profile = GetArg(args, "--profile") ?? GetArg(args, "-p");
+        var maxDepth = GetArgInt(args, "--max-depth");
+        var maxPages = GetArgInt(args, "--max-pages");
+        var configPath = GetArg(args, "--config");
+
+        using var cts = new CancellationTokenSource();
+        Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
+
+        await DiagnosticRunner.RunAsync(
+            targetId: targetId,
+            outputDir: outputDir,
+            profileName: profile,
+            maxDepthOverride: maxDepth,
+            maxPagesOverride: maxPages,
+            configPath: configPath,
+            ct: cts.Token);
+    }
+
+    /// <summary>
+    /// dotnet run -- compare --previous ./diagnostics/sitevision_ystad/baseline
+    ///                       --current ./diagnostics/sitevision_ystad/current
+    ///              [--output ./diagnostics/sitevision_ystad/current]
+    /// </summary>
+    private static async Task RunCompareAsync(string[] args)
+    {
+        var previousDir = GetArg(args, "--previous") ?? GetArg(args, "--prev");
+        var currentDir = GetArg(args, "--current");
+
+        if (string.IsNullOrWhiteSpace(previousDir) || string.IsNullOrWhiteSpace(currentDir))
+        {
+            Console.Error.WriteLine("Usage: dotnet run -- compare --previous <dir> --current <dir>");
+            return;
+        }
+
+        if (!Directory.Exists(previousDir))
+        {
+            Console.Error.WriteLine($"Previous dir not found: {previousDir}");
+            return;
+        }
+
+        if (!Directory.Exists(currentDir))
+        {
+            Console.Error.WriteLine($"Current dir not found: {currentDir}");
+            return;
+        }
+
+        var outputDir = GetArg(args, "--output") ?? GetArg(args, "--out") ?? currentDir;
+
+        Console.WriteLine($"[COMPARE] Previous: {previousDir}");
+        Console.WriteLine($"[COMPARE] Current:  {currentDir}");
+
+        var cmp = await RunComparisonBuilder.BuildAsync(
+            Path.GetFullPath(previousDir),
+            Path.GetFullPath(currentDir));
+
+        await ComparisonReportWriter.WriteAsync(Path.GetFullPath(outputDir), cmp);
+
+        Console.WriteLine($"[COMPARE] Verdict: {cmp.OverallVerdict.ToUpperInvariant()}");
+        if (cmp.Regressions.Count > 0)
+        {
+            Console.WriteLine("[COMPARE] Regressions:");
+            foreach (var r in cmp.Regressions) Console.WriteLine($"  - {r}");
+        }
+
+        if (cmp.Improvements.Count > 0)
+        {
+            Console.WriteLine("[COMPARE] Improvements:");
+            foreach (var i in cmp.Improvements) Console.WriteLine($"  + {i}");
+        }
+
+        Console.WriteLine($"[COMPARE] Report written to: {Path.Combine(Path.GetFullPath(outputDir), "comparison-report.md")}");
+    }
+
+    /// <summary>
+    /// dotnet run -- review-pack --current ./diagnostics/sitevision_ystad/2026-05-24_120000
+    ///              [--comparison ./diagnostics/sitevision_ystad/2026-05-24_120000/comparison-report.json]
+    /// </summary>
+    private static async Task RunReviewPackAsync(string[] args)
+    {
+        var currentDir = GetArg(args, "--current") ?? GetArg(args, "--dir");
+        if (string.IsNullOrWhiteSpace(currentDir) || !Directory.Exists(currentDir))
+        {
+            Console.Error.WriteLine("Usage: dotnet run -- review-pack --current <scrape-dir>");
+            return;
+        }
+
+        currentDir = Path.GetFullPath(currentDir);
+
+        RunComparison? comparison = null;
+        var cmpPath = GetArg(args, "--comparison")
+            ?? Path.Combine(currentDir, "comparison-report.json");
+
+        if (File.Exists(cmpPath))
+        {
+            try
+            {
+                var json = await File.ReadAllTextAsync(cmpPath, Encoding.UTF8);
+                comparison = JsonSerializer.Deserialize<RunComparison>(json, new JsonSerializerOptions
+                {
+                    PropertyNameCaseInsensitive = true
+                });
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[REVIEW-PACK] Could not load comparison: {ex.Message}");
+            }
+        }
+
+        await AiReviewPackBuilder.BuildAsync(currentDir, comparison);
+    }
+
+    /// <summary>
+    /// dotnet run -- acceptance --comparison ./diagnostics/sitevision_ystad/current/comparison-report.json
+    /// </summary>
+    private static async Task RunAcceptanceAsync(string[] args)
+    {
+        var cmpPath = GetArg(args, "--comparison")
+            ?? GetArg(args, "--report");
+
+        if (string.IsNullOrWhiteSpace(cmpPath))
+        {
+            Console.Error.WriteLine("Usage: dotnet run -- acceptance --comparison <comparison-report.json>");
+            return;
+        }
+
+        cmpPath = Path.GetFullPath(cmpPath);
+
+        var result = await AcceptanceGate.EvaluateAsync(cmpPath);
+
+        var opts = new JsonSerializerOptions { WriteIndented = true };
+        var resultJson = JsonSerializer.Serialize(result, opts);
+
+        Console.WriteLine(resultJson);
+        Console.WriteLine();
+        Console.WriteLine($"[ACCEPTANCE] Decision: {result.Decision.ToUpperInvariant()}");
+
+        // Write result next to the comparison report
+        var outDir = Path.GetDirectoryName(cmpPath) ?? ".";
+        var outPath = Path.Combine(outDir, "acceptance-result.json");
+        await File.WriteAllTextAsync(outPath, resultJson, Encoding.UTF8);
+        Console.WriteLine($"[ACCEPTANCE] Written: {outPath}");
+
+        // Exit code signals CI pipelines: 0=accepted, 1=requires_review, 2=rejected
+        Environment.Exit(result.Decision switch
+        {
+            "accepted" => 0,
+            "rejected" => 2,
+            _ => 1
+        });
+    }
+
+    // ── CLI argument helpers ─────────────────────────────────────────────────
+
+    private static string? GetArg(string[] args, string flag)
+    {
+        for (int i = 0; i < args.Length - 1; i++)
+            if (string.Equals(args[i], flag, StringComparison.OrdinalIgnoreCase))
+                return args[i + 1];
+        return null;
+    }
+
+    private static int? GetArgInt(string[] args, string flag)
+    {
+        var s = GetArg(args, flag);
+        return s != null && int.TryParse(s, out var v) ? v : null;
+    }
+
+    private static void ListTargets()
+    {
+        var configPath = Path.Combine(Directory.GetCurrentDirectory(), "config", "cms-targets.json");
+        if (!File.Exists(configPath))
+            configPath = Path.Combine(AppContext.BaseDirectory, "config", "cms-targets.json");
+
+        if (!File.Exists(configPath))
+        {
+            Console.WriteLine("(No cms-targets.json found — run from project root)");
+            return;
+        }
+
+        try
+        {
+            var json = File.ReadAllText(configPath);
+            var cfg = JsonSerializer.Deserialize<CmsTargetConfig>(json, new JsonSerializerOptions
+            {
+                PropertyNameCaseInsensitive = true
+            });
+
+            Console.WriteLine("Available targets:");
+            foreach (var t in cfg?.Targets ?? new())
+                Console.WriteLine($"  {t.Id,-40} {t.Name,-30} ({t.Cms}) {t.Url}");
+        }
+        catch { }
     }
 
     // Optional parallel runner if you want it later

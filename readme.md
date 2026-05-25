@@ -52,6 +52,20 @@ Open:
 
 ---
 
+## Local Development
+
+### Browser override
+
+If the default Playwright headless shell crashes on your machine (ICU data error at startup), point it at a working revision:
+
+```powershell
+$env:PLAYWRIGHT_CHROMIUM_SHELL = "$env:LOCALAPPDATA\ms-playwright\chromium_headless_shell-1223\chrome-headless-shell-win64\chrome-headless-shell.exe"
+```
+
+Set this in your PowerShell profile (`$PROFILE`) so it persists across sessions. The override is a no-op on machines where the default shell works.
+
+---
+
 ## Copyright and License
 
 Copyright © 2026 Dennis.

@@ -4,6 +4,8 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Playwright;
+using WebSnapshots.Diagnostic;
+using WebSnapshots.Telemetry;
 
 namespace WebSnapshots;
 
@@ -12,11 +14,15 @@ public sealed class NavCrawler
     private readonly SnapshotConfig _cfg;
     private readonly PlaywrightRunner _pw;
     private readonly Logger _log;
+    private readonly TelemetryWriter? _telemetry;
 
     public sealed class Options
     {
         public int MaxDepth { get; set; } = 3;
         public int MaxPagesPerSite { get; set; } = 1500;
+
+        // Expected CMS for telemetry mismatch detection. Null = not known.
+        public string? ExpectedCms { get; set; }
         public bool DropQueryStrings { get; set; } = true;
         public int ProgressEverySeconds { get; set; } = 20;
 
@@ -40,11 +46,12 @@ public sealed class NavCrawler
 
     private sealed record QItem(string Url, int Depth, string ParentUrl, bool StructuralBranch, string Text = "");
 
-    public NavCrawler(SnapshotConfig cfg, PlaywrightRunner pw, Logger log)
+    public NavCrawler(SnapshotConfig cfg, PlaywrightRunner pw, Logger log, TelemetryWriter? telemetry = null)
     {
         _cfg = cfg ?? throw new ArgumentNullException(nameof(cfg));
         _pw = pw ?? throw new ArgumentNullException(nameof(pw));
         _log = log ?? throw new ArgumentNullException(nameof(log));
+        _telemetry = telemetry;
     }
 
     public async Task<NavIndex> CrawlAsync(
@@ -113,6 +120,19 @@ public sealed class NavCrawler
                 ("cms", cms.Kind.ToString()),
                 ("confidence", cms.Confidence),
                 ("signals", string.Join(" | ", cms.Signals ?? new List<string>())));
+
+            var cmsMismatch = !string.IsNullOrWhiteSpace(opt.ExpectedCms) &&
+                !string.Equals(cms.Kind.ToString(), opt.ExpectedCms, StringComparison.OrdinalIgnoreCase);
+
+            _telemetry?.Emit(TelemetryPhase.CmsDetection, "cms_detected", TelemetrySeverity.Info,
+                startAbs, new Dictionary<string, object?>
+                {
+                    ["kind"] = cms.Kind.ToString(),
+                    ["confidence"] = cms.Confidence,
+                    ["signals"] = string.Join(", ", cms.Signals ?? new List<string>()),
+                    ["expectedCms"] = opt.ExpectedCms ?? "",
+                    ["mismatch"] = cmsMismatch
+                });
 
             navGroups = await cmsExtractor.ExtractStartPageNavGroupsAsync(
                 page,
@@ -283,6 +303,57 @@ public sealed class NavCrawler
             ("visibleGroups", visibleGroups.Count),
             ("visibleSeedUrls", visibleSeedUrls.Count));
 
+        {
+            var primaryGroup = navGroups.OrderBy(g => g.Rank).ThenByDescending(g => g.LinkCount).FirstOrDefault();
+            _telemetry?.Emit(TelemetryPhase.NavStartExtraction, "nav_groups_found", TelemetrySeverity.Info,
+                startAbs, new Dictionary<string, object?>
+                {
+                    ["navGroupCount"] = navGroups.Count,
+                    ["visibleGroupCount"] = visibleGroups.Count,
+                    ["primaryGroupId"] = primaryGroup?.Id ?? "",
+                    ["primaryLinkCount"] = primaryNavUrls.Count,
+                    ["visibleSeedCount"] = visibleSeedUrls.Count,
+                    ["groupIds"] = string.Join(", ", navGroups.Select(g => g.Id ?? ""))
+                });
+        }
+
+        // ── Structural promotion fallback ────────────────────────────────────
+        // When the primary nav group extracted zero usable links but visible groups
+        // contain municipal-section-shaped URLs, promote those into the structural
+        // primary list so they end up in treeFlat (not just allFlat).
+        if (primaryNavUrls.Count == 0 && visibleSeedUrls.Count > 0)
+        {
+            var promoted = new List<string>();
+            var rejected  = new List<string>();
+            foreach (var u in visibleSeedUrls)
+                (IsLikelyMunicipalSection(u) ? promoted : rejected).Add(u);
+
+            if (promoted.Count > 0)
+            {
+                foreach (var u in promoted)
+                    if (primaryNavSet.Add(u))
+                        primaryNavUrls.Add(u);
+
+                var reason = $"primary nav had zero usable links; promoted {promoted.Count} visible municipal section links";
+
+                _telemetry?.Emit(TelemetryPhase.NavStartExtraction, "visible_links_promoted_to_structural",
+                    TelemetrySeverity.Info, startAbs, new Dictionary<string, object?>
+                    {
+                        ["reason"]             = reason,
+                        ["visibleGroupId"]     = visibleGroups.FirstOrDefault()?.Id ?? "",
+                        ["promotedCount"]      = promoted.Count,
+                        ["rejectedCount"]      = rejected.Count,
+                        ["samplePromotedUrls"] = string.Join(", ", promoted.Take(5)),
+                        ["sampleRejectedUrls"] = string.Join(", ", rejected.Take(5))
+                    });
+
+                _log.Event("NAV_VISIBLE_PROMOTED",
+                    ("host", host),
+                    ("promoted", promoted.Count),
+                    ("rejected", rejected.Count));
+            }
+        }
+
         var allFlat = new List<NavItem>(capacity: Math.Min(opt.MaxPagesPerSite, 4096));
         var treeFlat = new List<NavItem>(capacity: Math.Min(opt.MaxPagesPerSite, 4096));
 
@@ -447,6 +518,16 @@ public sealed class NavCrawler
 
             string title = "";
             List<PageNavLink> outLinks = new();
+            var visitSucceeded = false;
+
+            _telemetry?.Emit(TelemetryPhase.Crawl, "page_visit_start", TelemetrySeverity.Info,
+                item.Url, new Dictionary<string, object?>
+                {
+                    ["depth"] = item.Depth,
+                    ["parentUrl"] = item.ParentUrl,
+                    ["structural"] = item.StructuralBranch,
+                    ["queueSize"] = q.Count
+                });
 
             const int maxNavAttempts = 2;
             for (int attempt = 1; attempt <= maxNavAttempts; attempt++)
@@ -467,6 +548,7 @@ public sealed class NavCrawler
                         protectedTopLevel: primaryNavSet,
                         cmsExtractor: cmsExtractor);
 
+                    visitSucceeded = true;
                     break;
                 }
                 catch (OperationCanceledException)
@@ -483,7 +565,53 @@ public sealed class NavCrawler
                     else
                     {
                         _log.Warn($"NAV_VISIT_FAIL depth={item.Depth} url={item.Url} {ex.GetType().Name}: {ex.Message}");
+                        var errorKind = ex is TimeoutException ? "timeout"
+                            : ex.GetType().Name.Contains("Playwright") ? "playwright"
+                            : "generic";
+                        _telemetry?.Emit(TelemetryPhase.Crawl, "page_visit_fail", TelemetrySeverity.Warning,
+                            item.Url, new Dictionary<string, object?>
+                            {
+                                ["depth"] = item.Depth,
+                                ["errorKind"] = errorKind,
+                                ["error"] = ex.Message
+                            });
                     }
+                }
+            }
+
+            if (visitSucceeded)
+            {
+                _telemetry?.Emit(TelemetryPhase.Crawl, "page_visit_success", TelemetrySeverity.Info,
+                    item.Url, new Dictionary<string, object?>
+                    {
+                        ["depth"] = item.Depth,
+                        ["parentUrl"] = item.ParentUrl,
+                        ["outlinkCount"] = outLinks.Count,
+                        ["titleLength"] = title.Length,
+                        ["structural"] = item.StructuralBranch
+                    });
+
+                if (_telemetry != null)
+                {
+                    try
+                    {
+                        var fp = await PageFingerprintExtractor.ExtractAsync(page, item.Url, cms.Kind.ToString());
+                        if (fp != null)
+                        {
+                            _telemetry.Emit(TelemetryPhase.Crawl, "page_fingerprint", TelemetrySeverity.Info,
+                                item.Url, new Dictionary<string, object?>
+                                {
+                                    ["fingerprintHash"] = fp.FingerprintHash,
+                                    ["pathShape"] = fp.PathShape,
+                                    ["contentType"] = fp.ContentType,
+                                    ["hasMain"] = fp.HasMain,
+                                    ["hasBreadcrumb"] = fp.HasBreadcrumb,
+                                    ["hasLocalNav"] = fp.HasLocalNav,
+                                    ["sectionBucket"] = fp.SectionBucket
+                                });
+                        }
+                    }
+                    catch { }
                 }
             }
 
@@ -654,6 +782,16 @@ public sealed class NavCrawler
 
         foreach (var g in navGroups)
             g.Nodes = NavTreeBuilder.Build(g.Flat, startAbs);
+
+        _telemetry?.Emit(TelemetryPhase.Crawl, "crawl_complete", TelemetrySeverity.Info,
+            startAbs, new Dictionary<string, object?>
+            {
+                ["totalPages"] = allFlat.Count,
+                ["maxDepthReached"] = depthVisited.Count > 0 ? depthVisited.Keys.Max() : 0,
+                ["maxPagesReached"] = allFlat.Count >= opt.MaxPagesPerSite,
+                ["elapsedMs"] = (long)sw.Elapsed.TotalMilliseconds,
+                ["pagesByDepth"] = string.Join(", ", depthVisited.OrderBy(kv => kv.Key).Select(kv => $"{kv.Key}:{kv.Value}"))
+            });
 
         return new NavIndex
         {
@@ -909,9 +1047,25 @@ public sealed class NavCrawler
                             .map(a => a.getAttribute('href') || '')
                             .filter(h => h && h.trim().length > 0)");
 
+            var rejectionCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
             foreach (var raw in hrefs)
             {
-                var child = NormalizeInternalUrl(raw, currentUrl, host, opt.DropQueryStrings);
+                var (child, rejectionReason) = ClassifyUrl(raw, currentUrl, host, opt.DropQueryStrings);
+
+                if (rejectionReason != null)
+                {
+                    rejectionCounts.TryGetValue(rejectionReason, out var rc);
+                    rejectionCounts[rejectionReason] = rc + 1;
+                    _telemetry?.Emit(TelemetryPhase.LinkFiltering, "link_rejected", TelemetrySeverity.Debug,
+                        raw?.Length > 200 ? raw[..200] : raw, new Dictionary<string, object?>
+                        {
+                            ["reason"] = rejectionReason,
+                            ["sourceType"] = "fallback_href"
+                        });
+                    continue;
+                }
+
                 if (string.IsNullOrWhiteSpace(child)) continue;
 
                 if (!ShouldAttachUnderParent(
@@ -921,6 +1075,8 @@ public sealed class NavCrawler
                     protectedTopLevel: protectedTopLevel,
                     isStructuralEdge: false))
                 {
+                    rejectionCounts.TryGetValue("outside_scope", out var osc);
+                    rejectionCounts["outside_scope"] = osc + 1;
                     continue;
                 }
 
@@ -938,6 +1094,22 @@ public sealed class NavCrawler
                         IsStructural = false
                     });
                 }
+                else
+                {
+                    rejectionCounts.TryGetValue("duplicate", out var dup);
+                    rejectionCounts["duplicate"] = dup + 1;
+                }
+            }
+
+            if (rejectionCounts.Count > 0)
+            {
+                _telemetry?.Emit(TelemetryPhase.LinkFiltering, "link_rejections_summary",
+                    TelemetrySeverity.Info, currentUrl,
+                    new Dictionary<string, object?>(rejectionCounts.ToDictionary(kv => kv.Key, kv => (object?)kv.Value))
+                    {
+                        ["pageUrl"] = currentUrl,
+                        ["accepted"] = result.Count
+                    });
             }
         }
         catch (Exception ex)
@@ -953,6 +1125,52 @@ public sealed class NavCrawler
             ("count", result.Count));
 
         return result;
+    }
+
+    // Returns the normalized URL and rejection reason (null = accepted).
+    private static (string? Url, string? RejectionReason) ClassifyUrl(
+        string? raw,
+        string currentUrl,
+        string host,
+        bool dropQueryStrings)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+            return (null, "empty_href");
+
+        var trimmed = raw.Trim();
+        if (trimmed.StartsWith("#", StringComparison.Ordinal))
+            return (null, "hash_link");
+        if (trimmed.StartsWith("javascript:", StringComparison.OrdinalIgnoreCase))
+            return (null, "javascript_link");
+        if (trimmed.StartsWith("mailto:", StringComparison.OrdinalIgnoreCase))
+            return (null, "mailto");
+        if (trimmed.StartsWith("tel:", StringComparison.OrdinalIgnoreCase))
+            return (null, "tel");
+
+        var abs = Utils.ToAbsoluteUrl(currentUrl, trimmed);
+        if (string.IsNullOrWhiteSpace(abs))
+            return (null, "invalid_url");
+
+        abs = Utils.NormalizeUrl(abs, dropQueryStrings);
+        if (!Utils.IsHttpUrl(abs))
+            return (null, "invalid_url");
+
+        try
+        {
+            var u = new Uri(abs);
+            if (!SameSiteHost(u.Host, host))
+                return (null, "external_host");
+            if (Utils.IsProbablyBinaryAsset(u.AbsolutePath))
+                return (null, "binary_asset");
+            var path = NormalizePath(u.AbsolutePath);
+            if (IsNoisePath(path))
+                return (null, "noise_path");
+            return (abs, null);
+        }
+        catch
+        {
+            return (null, "invalid_url");
+        }
     }
 
     private static string? NormalizeInternalUrl(
@@ -1220,5 +1438,49 @@ public sealed class NavCrawler
         }
 
         return Norm(a) == Norm(b);
+    }
+
+    // Returns true if the URL looks like a top-level municipal service section
+    // (single path segment, not a news/event/search/archive/utility page).
+    // Used by the structural-promotion fallback to decide which visible seeds
+    // to promote to the structural primary list.
+    private static bool IsLikelyMunicipalSection(string url)
+    {
+        string path;
+        try { path = new Uri(url).AbsolutePath; }
+        catch { return false; }
+
+        var segments = path.Trim('/').Split('/', StringSplitOptions.RemoveEmptyEntries);
+
+        // Only top-level single-segment paths (e.g. /barn-och-utbildning).
+        // Inner paths like /nyheter/article-name or /jobb/lediga-jobb are skipped.
+        if (segments.Length != 1)
+            return false;
+
+        var seg = segments[0].ToLowerInvariant();
+
+        // Reject known non-structural path prefixes
+        if (seg.Contains("nyheter") || seg.Contains("nyhet") || seg.Contains("news")
+            || seg.Contains("artikel") || seg.Contains("pressrelease") || seg.Contains("pressrum"))
+            return false;
+
+        if (seg.Contains("evenemang") || seg.Contains("event")
+            || seg.Contains("kalender") || seg.Contains("aktivitet"))
+            return false;
+
+        if (seg.Contains("arkiv") || seg.Contains("archive")
+            || seg.Contains("sok") || seg.Contains("search") || seg.Contains("hitta"))
+            return false;
+
+        if (seg.Contains("cookie") || seg.Contains("integritet") || seg.Contains("gdpr")
+            || seg.Contains("om-kakor") || seg.Contains("kakor"))
+            return false;
+
+        if (seg.Contains("webbkarta") || seg.Contains("sitemap")
+            || seg.Contains("driftinformation") || seg.Contains("tillganglighet")
+            || seg.Contains("tillgaenglighet"))
+            return false;
+
+        return true;
     }
 }
