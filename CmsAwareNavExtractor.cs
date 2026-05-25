@@ -720,6 +720,26 @@ async () => {
             "footercontact", "Kontakt", "FooterContact", 70, maxPerGroup);
         if (footerContact.Flat.Count > 0) groups.Add(footerContact);
 
+        // Generic heading-based fallback: fills any group that the narrower
+        // selector-based extractors above missed (e.g. Nyheter / Driftinformation
+        // on municipalities that use non-standard sol-* CSS classes).
+        var existingIds = new HashSet<string>(groups.Select(g => g.Id), StringComparer.OrdinalIgnoreCase);
+        var fallback    = await ExtractSiteVisionVisibleModuleFallbackAsync(page, pageUrl, host, dropQueryStrings, maxPerGroup);
+        var addedCount  = 0;
+
+        foreach (var fb in fallback)
+        {
+            if (existingIds.Contains(fb.Id)) continue;   // already covered by a specialised extractor
+            groups.Add(fb);
+            existingIds.Add(fb.Id);
+            addedCount++;
+        }
+
+        if (addedCount > 0)
+            _log?.Event("VISIBLE_MODULE_FALLBACK_USED",
+                ("host",        host),
+                ("groupsAdded", addedCount));
+
         return groups.OrderBy(x => x.Order).ToList();
     }
 
@@ -792,7 +812,8 @@ async () => {
                     Url = url,
                     Title = title.Trim(),
                     Depth = 1,
-                    ParentUrl = pageUrl
+                    ParentUrl = pageUrl,
+                    IsDisplayOnly = IsDisplayOnlyUrl(url, host)
                 });
 
                 if (group.Flat.Count >= maxPerGroup)
@@ -868,7 +889,8 @@ async () => {
                 Url = x.Url,
                 Title = x.Text,
                 Depth = 1,
-                ParentUrl = pageUrl
+                ParentUrl = pageUrl,
+                IsDisplayOnly = IsDisplayOnlyUrl(x.Url, host)
             });
         }
 
@@ -941,11 +963,173 @@ async () => {
                 Url = x.Url,
                 Title = x.Text,
                 Depth = 1,
-                ParentUrl = pageUrl
+                ParentUrl = pageUrl,
+                IsDisplayOnly = IsDisplayOnlyUrl(x.Url, host)
             });
         }
 
         return group;
+    }
+
+    // Generic DOM-walking fallback for SiteVision start pages.
+    //
+    // Scans heading elements in the main content area (excluding header, nav,
+    // footer, breadcrumbs, cookie banners) and groups nearby links by heading
+    // keyword classification. Used to fill gaps not covered by the narrower
+    // selector-based extractors above — e.g. when a municipality's Nyheter or
+    // Driftinformation section uses different CSS classes than the sol-* defaults.
+    private async Task<List<VisibleLinkGroup>> ExtractSiteVisionVisibleModuleFallbackAsync(
+        IPage page,
+        string pageUrl,
+        string host,
+        bool dropQueryStrings,
+        int maxPerGroup)
+    {
+        JsonElement raw;
+        try
+        {
+            raw = await page.EvaluateAsync<JsonElement>(@"
+() => {
+  // Heading text → stable group classification.
+  const KNOWN = [
+    { pat: /^\s*(nyheter|aktuellt)\s*$/i,                                           id: 'news',      label: 'Nyheter',          role: 'News',      order: 20 },
+    { pat: /^\s*(evenemang|händelser?)\s*$/i,                                       id: 'events',    label: 'Evenemang',        role: 'Events',    order: 30 },
+    { pat: /^\s*(driftinformation|driftstörningar?|störningar?)\s*$/i,              id: 'alerts',    label: 'Driftinformation', role: 'Alert',     order: 15 },
+    { pat: /^\s*(genvägar|populära\s+sidor|snabblänkar)\s*$/i,                      id: 'shortcuts', label: 'Genvägar',         role: 'Shortcut',  order: 10 },
+    { pat: /^\s*(kontakt(a\s+(oss|kommunen))?|kontaktuppgifter)\s*$/i,              id: 'contact',   label: 'Kontakt',          role: 'Contact',   order: 50 }
+  ];
+
+  // Zones that are never part of visible start-page content.
+  const EXCL_SELS = [
+    'header', 'footer', 'nav',
+    '[role=""banner""]', '[role=""navigation""]', '[role=""contentinfo""]',
+    '.sol-header', '.sol-footer', '.sol-menu', '.sol-breadcrumb',
+    '.sol-cookie', '.sol-cookie-banner', '.sol-tool-nav',
+    '.sv-nav', '.sv-menu', '#CookieConsent', '.cookie-banner'
+  ];
+
+  const excl = [];
+  for (const s of EXCL_SELS) {
+    try { excl.push(...document.querySelectorAll(s)); } catch {}
+  }
+  const isExcl = el => excl.some(ex => ex === el || ex.contains(el));
+
+  const badHref = h => {
+    const v = (h || '').trim().toLowerCase();
+    return !v || v === '#' || v.startsWith('#') ||
+           v.startsWith('javascript:') || v.startsWith('mailto:') || v.startsWith('tel:');
+  };
+
+  // All content headings, filtered out of excluded zones.
+  const headings = Array.from(document.querySelectorAll('h2, h3, h4'))
+    .filter(h => !isExcl(h));
+
+  const modules = [];
+
+  for (const heading of headings) {
+    const headText = (heading.textContent || '').replace(/\s+/g, ' ').trim();
+    const cls = KNOWN.find(k => k.pat.test(headText));
+    if (!cls) continue;
+
+    // Find the smallest ancestor that contains 1–40 anchor tags.
+    // This naturally stops at the column/portlet level in a multi-column
+    // layout rather than accidentally expanding to the whole page.
+    let block = heading.parentElement;
+    let found = false;
+    for (let i = 0; i < 6 && block && block !== document.body; i++) {
+      const n = block.querySelectorAll('a[href]').length;
+      if (n >= 1 && n <= 40) { found = true; break; }
+      if (n > 40) break;          // too broad — stop searching up
+      block = block.parentElement;
+    }
+    if (!found) continue;
+
+    const seen = new Set();
+    const links = [];
+    for (const a of block.querySelectorAll('a[href]')) {
+      if (isExcl(a)) continue;
+      const href = (a.getAttribute('href') || '').trim();
+      if (badHref(href)) continue;
+      let abs;
+      try { abs = new URL(href, document.location.href).toString(); } catch { continue; }
+      if (seen.has(abs)) continue;
+      seen.add(abs);
+      const text = (a.textContent || '').replace(/\s+/g, ' ').trim() || href;
+      links.push({ url: abs, text });
+    }
+
+    if (links.length === 0) continue;
+    modules.push({ id: cls.id, label: cls.label, role: cls.role, order: cls.order, headingText: headText, links });
+  }
+
+  return modules;
+}
+");
+        }
+        catch (Exception ex)
+        {
+            _log?.Warn($"VISIBLE_MODULE_FALLBACK_JS_FAIL {ex.Message}");
+            return new List<VisibleLinkGroup>();
+        }
+
+        if (raw.ValueKind != JsonValueKind.Array)
+            return new List<VisibleLinkGroup>();
+
+        // Merge all JS-returned modules into per-id groups (multiple headings
+        // for the same role are unified; links are deduplicated within each group).
+        var byId = new Dictionary<string, VisibleLinkGroup>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var mod in raw.EnumerateArray())
+        {
+            var id    = mod.TryGetProperty("id",          out var idP)  ? (idP.GetString()   ?? "") : "";
+            var label = mod.TryGetProperty("label",        out var lblP) ? (lblP.GetString()  ?? "") : id;
+            var role  = mod.TryGetProperty("role",         out var rolP) ? (rolP.GetString()  ?? "") : "";
+            var order = mod.TryGetProperty("order",        out var ordP)
+                        && ordP.ValueKind == JsonValueKind.Number ? ordP.GetInt32() : 99;
+            var htxt  = mod.TryGetProperty("headingText",  out var htP)  ? (htP.GetString()   ?? "") : "";
+
+            if (string.IsNullOrWhiteSpace(id)) continue;
+
+            if (!byId.TryGetValue(id, out var grp))
+            {
+                grp = new VisibleLinkGroup { Id = id, Label = label, Role = role, Order = order, Flat = new List<NavItem>() };
+                byId[id] = grp;
+            }
+
+            if (!mod.TryGetProperty("links", out var linksEl) || linksEl.ValueKind != JsonValueKind.Array)
+                continue;
+
+            foreach (var lnk in linksEl.EnumerateArray())
+            {
+                if (grp.Flat.Count >= maxPerGroup) break;
+
+                var urlRaw = lnk.TryGetProperty("url",  out var uP) ? (uP.GetString() ?? "") : "";
+                var text   = lnk.TryGetProperty("text", out var tP) ? (tP.GetString() ?? "") : "";
+
+                var url = NormalizeInternalUrl(urlRaw, pageUrl, host, dropQueryStrings);
+                if (string.IsNullOrWhiteSpace(url)) continue;
+                if (grp.Flat.Any(x => x.Url.Equals(url, StringComparison.OrdinalIgnoreCase))) continue;
+
+                grp.Flat.Add(new NavItem
+                {
+                    Url           = url,
+                    Title         = string.IsNullOrWhiteSpace(text) ? url : text.Trim(),
+                    Depth         = 1,
+                    ParentUrl     = pageUrl,
+                    IsDisplayOnly = IsDisplayOnlyUrl(url, host)
+                });
+            }
+
+            _log?.Event("VISIBLE_MODULE_FALLBACK_GROUP_FOUND",
+                ("headingText", htxt),
+                ("groupId",     id),
+                ("linksFound",  grp.Flat.Count));
+        }
+
+        return byId.Values
+            .Where(g => g.Flat.Count > 0)
+            .OrderBy(g => g.Order)
+            .ToList();
     }
 
     private async Task<List<VisibleLinkGroup>> ExtractGenericVisibleGroupsAsync(
@@ -1024,7 +1208,8 @@ async () => {
                 Url = x.Url,
                 Title = x.Text,
                 Depth = 1,
-                ParentUrl = pageUrl
+                ParentUrl = pageUrl,
+                IsDisplayOnly = IsDisplayOnlyUrl(x.Url, host)
             }).ToList()
         };
     }
@@ -1483,7 +1668,12 @@ async () => {
         return list;
     }
 
-    private static string? NormalizeInternalUrl(string? raw, string currentUrl, string host, bool dropQueryStrings)
+    private static string? NormalizeInternalUrl(
+        string? raw,
+        string currentUrl,
+        string host,
+        bool dropQueryStrings,
+        bool relaxNoiseFilter = false)
     {
         var abs = string.IsNullOrWhiteSpace(currentUrl)
             ? raw
@@ -1505,7 +1695,10 @@ async () => {
 
             var path = (u.AbsolutePath ?? "").TrimEnd('/');
 
-            if (IsNoisePath(path))
+            // The noise filter is intentionally relaxed for visible-group link
+            // collection: news article and driftinformation URLs are exactly the
+            // content we want to surface in those start-page modules.
+            if (!relaxNoiseFilter && IsNoisePath(path))
                 return null;
 
             if (!string.Equals(u.Host, host, StringComparison.OrdinalIgnoreCase))
@@ -1533,7 +1726,10 @@ async () => {
         if (p.StartsWith("/webbkarta/", StringComparison.OrdinalIgnoreCase)) return true;
         if (p.EndsWith("/rss", StringComparison.OrdinalIgnoreCase)) return true;
         if (p.Contains("/nyhetsarkiv/", StringComparison.OrdinalIgnoreCase)) return true;
-        if (p.Contains("/driftinformation", StringComparison.OrdinalIgnoreCase)) return true;
+        // Block individual drift-notice articles (path segment /driftinformation/ with
+        // trailing slash) but not the section-index page
+        // (e.g. /driftinformation.4.xxx.html or /driftinformation at root level).
+        if (p.Contains("/driftinformation/", StringComparison.OrdinalIgnoreCase)) return true;
 
         // WordPress admin / system paths — never worth archiving
         if (p.Equals("/wp-admin", StringComparison.OrdinalIgnoreCase)) return true;
@@ -1721,6 +1917,35 @@ async () => {
         if (footer.Flat.Count > 0) groups.Add(footer);
 
         return groups.OrderBy(x => x.Order).ToList();
+    }
+
+    // Returns true when a URL from a visible group is a display-only link that
+    // should appear in the viewer but NOT become a structural crawl-expansion
+    // root.  Structural seeds are section-index pages (1-2 path segments, no
+    // date prefix).  Article-level pages and external URLs are display-only.
+    private static bool IsDisplayOnlyUrl(string url, string host)
+    {
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var u)) return false;
+
+        // External URLs are display-only by definition (can't be crawled).
+        if (!string.Equals(u.Host, host, StringComparison.OrdinalIgnoreCase)) return true;
+
+        var segments = u.AbsolutePath
+            .Trim('/')
+            .Split('/', StringSplitOptions.RemoveEmptyEntries);
+
+        // Deep paths (≥ 3 segments) are article/leaf pages, not section indexes.
+        if (segments.Length >= 3) return true;
+
+        // Date-prefixed segments (YYYY-) signal individual article URLs.
+        foreach (var seg in segments)
+            if (seg.Length >= 5
+                && char.IsDigit(seg[0]) && char.IsDigit(seg[1])
+                && char.IsDigit(seg[2]) && char.IsDigit(seg[3])
+                && seg[4] == '-')
+                return true;
+
+        return false;
     }
 
     private static bool SameSiteHost(string a, string b)

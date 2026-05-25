@@ -266,12 +266,21 @@ public sealed class NavCrawler
         }
 
         var visibleSeedUrls = new List<string>();
-        var visibleSeedSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var visibleSeedSet  = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var displayOnlyCount = 0;
 
         foreach (var g in visibleGroups)
         {
             foreach (var it in g.Flat)
             {
+                // Display-only links (articles, external cards) are shown in the
+                // viewer but must NOT become structural crawl-expansion roots.
+                if (it.IsDisplayOnly)
+                {
+                    displayOnlyCount++;
+                    continue;
+                }
+
                 var u = Utils.NormalizeUrl(it.Url, opt.DropQueryStrings);
                 if (string.IsNullOrWhiteSpace(u)) continue;
                 if (u.Equals(startAbs, StringComparison.OrdinalIgnoreCase)) continue;
@@ -296,24 +305,31 @@ public sealed class NavCrawler
             }
         }
 
+        if (displayOnlyCount > 0)
+            _log.Event("VISIBLE_DISPLAY_ONLY_SKIPPED",
+                ("host",  host),
+                ("count", displayOnlyCount));
+
         _log.Event("NAV_GROUPS_EXTRACTED",
             ("host", host),
             ("groups", navGroups.Count),
             ("primaryCount", primaryNavUrls.Count),
             ("visibleGroups", visibleGroups.Count),
-            ("visibleSeedUrls", visibleSeedUrls.Count));
+            ("visibleSeedUrls", visibleSeedUrls.Count),
+            ("displayOnlyLinks", displayOnlyCount));
 
         {
             var primaryGroup = navGroups.OrderBy(g => g.Rank).ThenByDescending(g => g.LinkCount).FirstOrDefault();
             _telemetry?.Emit(TelemetryPhase.NavStartExtraction, "nav_groups_found", TelemetrySeverity.Info,
                 startAbs, new Dictionary<string, object?>
                 {
-                    ["navGroupCount"] = navGroups.Count,
-                    ["visibleGroupCount"] = visibleGroups.Count,
-                    ["primaryGroupId"] = primaryGroup?.Id ?? "",
-                    ["primaryLinkCount"] = primaryNavUrls.Count,
-                    ["visibleSeedCount"] = visibleSeedUrls.Count,
-                    ["groupIds"] = string.Join(", ", navGroups.Select(g => g.Id ?? ""))
+                    ["navGroupCount"]       = navGroups.Count,
+                    ["visibleGroupCount"]   = visibleGroups.Count,
+                    ["primaryGroupId"]      = primaryGroup?.Id ?? "",
+                    ["primaryLinkCount"]    = primaryNavUrls.Count,
+                    ["visibleSeedCount"]    = visibleSeedUrls.Count,
+                    ["displayOnlyLinks"]    = displayOnlyCount,
+                    ["groupIds"]            = string.Join(", ", navGroups.Select(g => g.Id ?? ""))
                 });
         }
 
@@ -777,6 +793,16 @@ public sealed class NavCrawler
                     ("elapsedSec", (int)sw.Elapsed.TotalSeconds));
             }
         }
+
+        // Post-crawl URL-path reparenting pass.
+        // SiteVision (and similar CMSes) often render section child pages via JavaScript,
+        // so they are not visible in the DOM during the fast nav-crawl phase.  Those pages
+        // end up discovered only via the start-page nav and are therefore recorded as direct
+        // children of root.  After the crawl we scan allFlat for pages whose URL path puts
+        // them structurally under a known section page and re-parent them so the tree
+        // reflects the real hierarchy.  The fix to GetSectionPrefix / CanonicalizeSectionPrefix
+        // makes IsUrlDescendantOf work correctly for numeric-ID SiteVision URLs.
+        ReparentOrphansByUrlPath(allFlat, treeFlat, treeFlatEdges, startAbs);
 
         var nodes = NavTreeBuilder.Build(treeFlat, startAbs);
 
@@ -1374,6 +1400,70 @@ public sealed class NavCrawler
         return childPath.StartsWith(parentSection + "/", StringComparison.OrdinalIgnoreCase);
     }
 
+    // After the crawl loop, pages seeded directly from the start page may have a more
+    // specific natural parent (a structural section page whose URL is an ancestor of theirs).
+    // This happens on CMS sites (e.g. SiteVision) where section landing pages render their
+    // child-page grid via JavaScript, making it invisible during the fast nav-crawl phase.
+    // We scan allFlat for such pages and re-parent them to the best structural section ancestor.
+    // GetSectionPrefix/CanonicalizeSectionPrefix must be correct for this to work.
+    private static void ReparentOrphansByUrlPath(
+        List<NavItem> allFlat,
+        List<NavItem> treeFlat,
+        HashSet<string> treeFlatEdges,
+        string startUrl)
+    {
+        // Structural section pages: treeFlat items that are direct children of root (depth 1).
+        var sectionPages = treeFlat
+            .Where(p => !string.IsNullOrWhiteSpace(p.Url)
+                     && !p.Url.Equals(startUrl, StringComparison.OrdinalIgnoreCase)
+                     && p.ParentUrl.Equals(startUrl, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
+        if (sectionPages.Count == 0) return;
+
+        foreach (var item in allFlat)
+        {
+            if (string.IsNullOrWhiteSpace(item.Url)) continue;
+            if (item.Url.Equals(startUrl, StringComparison.OrdinalIgnoreCase)) continue;
+            if (!item.ParentUrl.Equals(startUrl, StringComparison.OrdinalIgnoreCase)) continue;
+
+            // Find the deepest (longest prefix) structural section page that is an ancestor.
+            NavItem? bestParent = null;
+            int bestPrefixLen = 0;
+
+            foreach (var section in sectionPages)
+            {
+                if (section.Url.Equals(item.Url, StringComparison.OrdinalIgnoreCase)) continue;
+                if (!IsUrlDescendantOf(section.Url, item.Url)) continue;
+
+                if (!Uri.TryCreate(section.Url, UriKind.Absolute, out var sectionUri)) continue;
+                var prefixLen = GetSectionPrefix(sectionUri.AbsolutePath).Length;
+                if (prefixLen > bestPrefixLen)
+                {
+                    bestPrefixLen = prefixLen;
+                    bestParent = section;
+                }
+            }
+
+            if (bestParent == null) continue;
+
+            item.ParentUrl = bestParent.Url;
+            item.Depth = bestParent.Depth + 1;
+
+            var edgeKey = $"{bestParent.Url}|{item.Url}";
+            if (treeFlatEdges.Add(edgeKey))
+            {
+                treeFlat.Add(new NavItem
+                {
+                    Url = item.Url,
+                    Title = item.Title,
+                    Depth = item.Depth,
+                    ParentUrl = item.ParentUrl
+                });
+            }
+        }
+    }
+
     private static string GetSectionPrefix(string path)
     {
         path = NormalizePath(path);
@@ -1384,6 +1474,25 @@ public sealed class NavCrawler
         if (path.EndsWith(".html", StringComparison.OrdinalIgnoreCase))
             path = path[..^5];
 
+        // SiteVision often appends numeric page IDs before .html (e.g. /barnochutbildning.2142.html).
+        // Child URLs use the clean section path (/barnochutbildning/...), so strip the numeric suffix
+        // so that parent-child prefix containment checks work correctly.
+        path = CanonicalizeSectionPrefix(path);
+
+        return path;
+    }
+
+    // Strips a trailing SiteVision numeric page-ID segment of the form .\d+ from a path.
+    // Example: /barnochutbildning.2142 => /barnochutbildning
+    private static string CanonicalizeSectionPrefix(string path)
+    {
+        int dot = path.LastIndexOf('.');
+        if (dot > 0)
+        {
+            var suffix = path[(dot + 1)..];
+            if (suffix.Length > 0 && suffix.All(char.IsDigit))
+                path = path[..dot];
+        }
         return path;
     }
 

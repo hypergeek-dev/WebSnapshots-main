@@ -55,6 +55,14 @@ public sealed class NavItem
     // True when this item was only reachable via query string parameters
     // (e.g. JS-rendered event lists where all items share the same base URL).
     public bool IsJsDynamic { get; set; } = false;
+
+    // True when this link should be shown in the viewer but NOT enqueued as a
+    // structural crawl-expansion root (e.g. individual news articles, alert
+    // notices, or external cards visible on the start page).
+    // Omitted from JSON when false (the default) to keep nav.json compact.
+    [System.Text.Json.Serialization.JsonIgnore(
+        Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingDefault)]
+    public bool IsDisplayOnly { get; set; } = false;
 }
 
 public sealed class NavNode
