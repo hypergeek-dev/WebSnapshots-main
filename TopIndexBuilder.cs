@@ -21,7 +21,7 @@ public sealed class TopIndexBuilder
             var host = E(it.Host);
             var status = E(it.Status);
 
-            var link = E(it.ViewerRel);
+            var link = "../../" + E(it.ViewerRel);
             if (!link.Contains('#')) link += "#start";
 
             sb.AppendLine($@"<li><a href=""{link}"">{name}</a> <small class=""muted"">({host})</small> <span class=""badge"">{status}</span> <small class=""muted"">pages:{it.PagesDone}</small></li>");
@@ -47,7 +47,7 @@ a{{color:var(--accent);text-decoration:none}}
 a:hover{{text-decoration:underline}}
 </style>
 <header>
-  <div class=""sub""><a href=""../index.htm"">← All runs</a></div>
+  <div class=""sub""><a href=""../../index.htm"">← All runs</a></div>
   <h1>Web Snapshots</h1>
   <div class=""sub"">Run: {E(runFolderName)}</div>
   <div class=""sub"">Generated: {now:yyyy-MM-dd HH:mm}</div>

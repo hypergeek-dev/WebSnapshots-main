@@ -12,9 +12,10 @@ public static class GlobalIndexBuilder
 
         var manifests = new List<RunManifest>();
 
-        if (Directory.Exists(outputBaseDir))
+        var runsDir = Path.Combine(outputBaseDir, "_runs");
+        if (Directory.Exists(runsDir))
         {
-            foreach (var dir in Directory.EnumerateDirectories(outputBaseDir))
+            foreach (var dir in Directory.EnumerateDirectories(runsDir))
             {
                 var mf = Path.Combine(dir, "run.json");
                 if (!File.Exists(mf)) continue;
@@ -72,7 +73,7 @@ public static class GlobalIndexBuilder
             foreach (var m in manifests)
             {
                 var runFolder = m.RunFolderName;
-                var runIndexHref = $"{E(runFolder)}/index.htm";
+                var runIndexHref = $"_runs/{E(runFolder)}/index.htm";
                 sb.AppendLine("<div class=\"run\">");
                 sb.AppendLine("  <div class=\"runTitle\">");
                 sb.Append("    <h2 style=\"margin:0\"><a href=\"").Append(runIndexHref).Append("\">").Append(E(runFolder)).AppendLine("</a></h2>");
@@ -85,7 +86,7 @@ public static class GlobalIndexBuilder
                     sb.AppendLine("  <ul>");
                     foreach (var it in m.Results.OrderBy(x => x.DisplayName, StringComparer.OrdinalIgnoreCase))
                     {
-                        var viewerHref = $"{E(runFolder)}/{E(it.ViewerRel)}";
+                        var viewerHref = E(it.ViewerRel);
                         if (!viewerHref.Contains('#')) viewerHref += "#start";
 
                         sb.Append("    <li><a href=\"").Append(viewerHref).Append("\">").Append(E(it.DisplayName)).Append("</a>");

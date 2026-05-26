@@ -494,6 +494,7 @@ public sealed class NavCrawler
         var depthVisited = new Dictionary<int, int>();
         var sw = System.Diagnostics.Stopwatch.StartNew();
         var lastProgress = DateTimeOffset.Now;
+        var maxPagesReachedBeforeDedupe = false;
 
         while (q.Count > 0)
         {
@@ -508,6 +509,7 @@ public sealed class NavCrawler
 
             if (allFlat.Count >= opt.MaxPagesPerSite)
             {
+                maxPagesReachedBeforeDedupe = true;
                 _log.Warn($"NAV_MAXPAGES reached {opt.MaxPagesPerSite}");
                 break;
             }
@@ -802,9 +804,14 @@ public sealed class NavCrawler
         // them structurally under a known section page and re-parent them so the tree
         // reflects the real hierarchy.  The fix to GetSectionPrefix / CanonicalizeSectionPrefix
         // makes IsUrlDescendantOf work correctly for numeric-ID SiteVision URLs.
-        ReparentOrphansByUrlPath(allFlat, treeFlat, treeFlatEdges, startAbs);
+        // For WordPress/Municipio, a second URL-path-based strategy handles clean-slug URLs
+        // where intermediate section pages may not be in treeFlat.
+        ReparentOrphansByUrlPath(allFlat, treeFlat, treeFlatEdges, startAbs, _log);
 
-        var nodes = NavTreeBuilder.Build(treeFlat, startAbs);
+        allFlat = FinalizeFlatNavigation(allFlat, startAbs, _log);
+        treeFlat = FinalizeTreeFlat(treeFlat, allFlat, _log);
+
+        var nodes = NavTreeBuilder.Build(allFlat, startAbs);
 
         foreach (var g in navGroups)
             g.Nodes = NavTreeBuilder.Build(g.Flat, startAbs);
@@ -814,7 +821,7 @@ public sealed class NavCrawler
             {
                 ["totalPages"] = allFlat.Count,
                 ["maxDepthReached"] = depthVisited.Count > 0 ? depthVisited.Keys.Max() : 0,
-                ["maxPagesReached"] = allFlat.Count >= opt.MaxPagesPerSite,
+                ["maxPagesReached"] = maxPagesReachedBeforeDedupe || allFlat.Count >= opt.MaxPagesPerSite,
                 ["elapsedMs"] = (long)sw.Elapsed.TotalMilliseconds,
                 ["pagesByDepth"] = string.Join(", ", depthVisited.OrderBy(kv => kv.Key).Select(kv => $"{kv.Key}:{kv.Value}"))
             });
@@ -823,6 +830,7 @@ public sealed class NavCrawler
         {
             Host = host,
             StartUrl = startAbs,
+            CmsKind = cms.Kind.ToString(),
             GeneratedUtc = DateTime.UtcNow,
             Flat = allFlat,
             Nodes = nodes,
@@ -1402,32 +1410,78 @@ public sealed class NavCrawler
 
     // After the crawl loop, pages seeded directly from the start page may have a more
     // specific natural parent (a structural section page whose URL is an ancestor of theirs).
-    // This happens on CMS sites (e.g. SiteVision) where section landing pages render their
-    // child-page grid via JavaScript, making it invisible during the fast nav-crawl phase.
-    // We scan allFlat for such pages and re-parent them to the best structural section ancestor.
-    // GetSectionPrefix/CanonicalizeSectionPrefix must be correct for this to work.
+    // This happens on:
+    //   SiteVision: section landing pages render child-page grids via JS, invisible during crawl.
+    //   WordPress/Municipio: WP REST API returns all pages flat; sitemap seeds attach to root.
+    //
+    // Two strategies are used in order:
+    //   1. Section-page ancestor lookup (treeFlat depth-1 items + IsUrlDescendantOf).
+    //      Handles SiteVision numeric-ID URLs via GetSectionPrefix/CanonicalizeSectionPrefix.
+    //   2. URL-path ancestor lookup from allFlatByUrl (all visited pages).
+    //      Handles WordPress clean-slug URLs where intermediate pages may not be in treeFlat.
+    //
+    // Candidates are sorted by URL path segment count (ascending) so that intermediate
+    // section pages are reparented before their children — this ensures
+    // item.Depth = parent.Depth + 1 is computed correctly in a single pass.
+    //
+    // When an item is reparented, its corresponding treeFlat entry (a separate object) is
+    // also updated in-place so NavTreeBuilder.Build(treeFlat) sees the corrected parent.
     private static void ReparentOrphansByUrlPath(
         List<NavItem> allFlat,
         List<NavItem> treeFlat,
         HashSet<string> treeFlatEdges,
-        string startUrl)
+        string startUrl,
+        Logger? log = null)
     {
-        // Structural section pages: treeFlat items that are direct children of root (depth 1).
+        // Strategy 1 source: structural section pages already in treeFlat at depth 1.
         var sectionPages = treeFlat
             .Where(p => !string.IsNullOrWhiteSpace(p.Url)
                      && !p.Url.Equals(startUrl, StringComparison.OrdinalIgnoreCase)
                      && p.ParentUrl.Equals(startUrl, StringComparison.OrdinalIgnoreCase))
             .ToList();
 
-        if (sectionPages.Count == 0) return;
+        // Strategy 2 source: all visited pages (allFlat) keyed by URL.
+        var allFlatByUrl = new Dictionary<string, NavItem>(StringComparer.OrdinalIgnoreCase);
+        foreach (var it in allFlat)
+            if (!string.IsNullOrWhiteSpace(it.Url) && !allFlatByUrl.ContainsKey(it.Url))
+                allFlatByUrl[it.Url] = it;
 
-        foreach (var item in allFlat)
+        // treeFlat item index: for in-place parent update when reparenting.
+        var treeFlatByUrl = new Dictionary<string, NavItem>(StringComparer.OrdinalIgnoreCase);
+        foreach (var it in treeFlat)
+            if (!string.IsNullOrWhiteSpace(it.Url) && !treeFlatByUrl.ContainsKey(it.Url))
+                treeFlatByUrl[it.Url] = it;
+
+        if (sectionPages.Count == 0 && allFlatByUrl.Count == 0)
+            return;
+
+        // Snapshot root-level count before changes (for telemetry).
+        var rootLevelBefore = 0;
+        foreach (var it in allFlat)
         {
-            if (string.IsNullOrWhiteSpace(item.Url)) continue;
-            if (item.Url.Equals(startUrl, StringComparison.OrdinalIgnoreCase)) continue;
-            if (!item.ParentUrl.Equals(startUrl, StringComparison.OrdinalIgnoreCase)) continue;
+            if (!string.IsNullOrWhiteSpace(it.Url)
+                && !it.Url.Equals(startUrl, StringComparison.OrdinalIgnoreCase)
+                && it.ParentUrl.Equals(startUrl, StringComparison.OrdinalIgnoreCase))
+                rootLevelBefore++;
+        }
 
-            // Find the deepest (longest prefix) structural section page that is an ancestor.
+        // Candidates: allFlat root-children sorted by segment count (parents before children).
+        var candidates = new List<NavItem>(allFlat.Count);
+        foreach (var it in allFlat)
+        {
+            if (string.IsNullOrWhiteSpace(it.Url)) continue;
+            if (it.Url.Equals(startUrl, StringComparison.OrdinalIgnoreCase)) continue;
+            if (!it.ParentUrl.Equals(startUrl, StringComparison.OrdinalIgnoreCase)) continue;
+            candidates.Add(it);
+        }
+        candidates.Sort((a, b) =>
+            CountUrlPathSegments(a.Url).CompareTo(CountUrlPathSegments(b.Url)));
+
+        var inferred = 0;
+
+        foreach (var item in candidates)
+        {
+            // -- Strategy 1: deepest treeFlat-section-page ancestor (SiteVision-safe) --
             NavItem? bestParent = null;
             int bestPrefixLen = 0;
 
@@ -1445,22 +1499,411 @@ public sealed class NavCrawler
                 }
             }
 
+            // -- Strategy 2: URL-path lookup in allFlatByUrl (WordPress clean-slug URLs) --
+            // Used when Strategy 1 found no ancestor (e.g. intermediate section page is in
+            // allFlat but not in treeFlat, or was reparented and is no longer at depth 1).
+            if (bestParent == null)
+            {
+                var ancestorUrl = FindNearestKnownAncestorUrl(item.Url, allFlatByUrl, startUrl);
+                if (ancestorUrl != null)
+                    bestParent = allFlatByUrl[ancestorUrl];
+            }
+
             if (bestParent == null) continue;
 
             item.ParentUrl = bestParent.Url;
-            item.Depth = bestParent.Depth + 1;
+            item.Depth     = bestParent.Depth + 1;
 
+            // Update the treeFlat item in-place so NavTreeBuilder.Build(treeFlat) sees the
+            // corrected parent.  treeFlat items are separate objects from allFlat items.
+            if (treeFlatByUrl.TryGetValue(item.Url, out var treeItem)
+                && treeItem.ParentUrl.Equals(startUrl, StringComparison.OrdinalIgnoreCase))
+            {
+                treeItem.ParentUrl = bestParent.Url;
+                treeItem.Depth     = bestParent.Depth + 1;
+            }
+
+            // Ensure the reparented item has a treeFlat edge under the new parent.
             var edgeKey = $"{bestParent.Url}|{item.Url}";
             if (treeFlatEdges.Add(edgeKey))
             {
                 treeFlat.Add(new NavItem
                 {
-                    Url = item.Url,
-                    Title = item.Title,
-                    Depth = item.Depth,
+                    Url       = item.Url,
+                    Title     = item.Title,
+                    Depth     = item.Depth,
                     ParentUrl = item.ParentUrl
                 });
             }
+
+            log?.Event("URL_PARENT_INFERRED",
+                ("url",    item.Url),
+                ("parent", bestParent.Url));
+
+            inferred++;
+        }
+
+        if (inferred > 0)
+        {
+            var rootLevelAfter = 0;
+            foreach (var it in allFlat)
+            {
+                if (!string.IsNullOrWhiteSpace(it.Url)
+                    && !it.Url.Equals(startUrl, StringComparison.OrdinalIgnoreCase)
+                    && it.ParentUrl.Equals(startUrl, StringComparison.OrdinalIgnoreCase))
+                    rootLevelAfter++;
+            }
+
+            log?.Event("URL_HIERARCHY_RECONSTRUCTION_USED",
+                ("inferred",       inferred),
+                ("rootLevelBefore", rootLevelBefore),
+                ("rootLevelAfter",  rootLevelAfter));
+
+            log?.Event("ROOT_LEVEL_PAGE_REDUCED",
+                ("before",  rootLevelBefore),
+                ("after",   rootLevelAfter),
+                ("reduced", rootLevelBefore - rootLevelAfter));
+
+            try
+            {
+                var maxDepthAfter = allFlat.Count > 0 ? allFlat.Max(it => it.Depth) : 0;
+                log?.Event("HIERARCHY_RECONSTRUCTION_SUMMARY",
+                    ("startUrl",              startUrl),
+                    ("rootLevelBefore",       rootLevelBefore),
+                    ("rootLevelAfter",        rootLevelAfter),
+                    ("inferredRelationships", inferred),
+                    ("maxDepthAfter",         maxDepthAfter));
+            }
+            catch { }
+        }
+    }
+
+    private static List<NavItem> FinalizeFlatNavigation(
+        List<NavItem> flat,
+        string startUrl,
+        Logger? log)
+    {
+        var canonicalStart = CanonicalUrlKey(startUrl);
+        var byKey = new Dictionary<string, NavItem>(StringComparer.OrdinalIgnoreCase);
+        var firstOrder = new List<string>();
+        var duplicateExtras = 0;
+
+        foreach (var raw in flat)
+        {
+            var key = CanonicalUrlKey(raw.Url);
+            if (string.IsNullOrWhiteSpace(key)) continue;
+
+            var normalized = CloneWithCanonicalUrls(raw);
+
+            if (!byKey.TryGetValue(key, out var existing))
+            {
+                byKey[key] = normalized;
+                firstOrder.Add(key);
+                continue;
+            }
+
+            duplicateExtras++;
+            byKey[key] = ChooseBetterNavItem(existing, normalized, canonicalStart);
+        }
+
+        if (duplicateExtras > 0)
+            log?.Event("DUPLICATE_URLS_REMOVED",
+                ("duplicatesRemoved", duplicateExtras),
+                ("uniqueUrls", byKey.Count));
+
+        var keptKeys = byKey.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var urlByKey = byKey.ToDictionary(kv => kv.Key, kv => kv.Value.Url, StringComparer.OrdinalIgnoreCase);
+
+        foreach (var item in byKey.Values)
+        {
+            var itemKey = CanonicalUrlKey(item.Url);
+
+            if (itemKey.Equals(canonicalStart, StringComparison.OrdinalIgnoreCase))
+            {
+                item.ParentUrl = "";
+                continue;
+            }
+
+            var parentKey = CanonicalUrlKey(item.ParentUrl);
+            if (string.IsNullOrWhiteSpace(parentKey)
+                || parentKey.Equals(itemKey, StringComparison.OrdinalIgnoreCase)
+                || !keptKeys.Contains(parentKey)
+                || IsUrlDescendantOf(item.Url, item.ParentUrl))
+            {
+                parentKey = FindNearestKnownAncestorKey(item.Url, keptKeys, canonicalStart)
+                    ?? canonicalStart;
+            }
+
+            item.ParentUrl = urlByKey.TryGetValue(parentKey, out var parentUrl)
+                ? parentUrl
+                : startUrl;
+        }
+
+        var recalculated = RecalculateDepths(
+            firstOrder.Select(k => byKey[k]).ToList(),
+            startUrl,
+            log);
+
+        return recalculated;
+    }
+
+    private static List<NavItem> FinalizeTreeFlat(
+        List<NavItem> treeFlat,
+        List<NavItem> correctedFlat,
+        Logger? log)
+    {
+        if (treeFlat.Count == 0)
+            return correctedFlat;
+
+        var structuralKeys = treeFlat
+            .Select(x => CanonicalUrlKey(x.Url))
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var synced = correctedFlat
+            .Where(x => structuralKeys.Contains(CanonicalUrlKey(x.Url)))
+            .Select(CloneWithCanonicalUrls)
+            .ToList();
+
+        return synced.Count > 0 ? synced : correctedFlat;
+    }
+
+    private static NavItem ChooseBetterNavItem(NavItem a, NavItem b, string canonicalStart)
+    {
+        var scoreA = NavItemScore(a, canonicalStart);
+        var scoreB = NavItemScore(b, canonicalStart);
+
+        var bWins = scoreB > scoreA;
+        var winner = CloneWithCanonicalUrls(bWins ? b : a);
+        var other = bWins ? a : b;
+
+        if (TitleScore(other) > TitleScore(winner))
+            winner.Title = other.Title;
+
+        winner.IsExternal = a.IsExternal || b.IsExternal;
+        winner.IsJsDynamic = a.IsJsDynamic || b.IsJsDynamic;
+        winner.IsDisplayOnly = a.IsDisplayOnly && b.IsDisplayOnly;
+        return winner;
+    }
+
+    private static int NavItemScore(NavItem item, string canonicalStart)
+    {
+        var urlKey = CanonicalUrlKey(item.Url);
+        var parentKey = CanonicalUrlKey(item.ParentUrl);
+        var isRoot = urlKey.Equals(canonicalStart, StringComparison.OrdinalIgnoreCase);
+        var hasParent = !string.IsNullOrWhiteSpace(parentKey)
+            && !parentKey.Equals(urlKey, StringComparison.OrdinalIgnoreCase)
+            && !IsUrlDescendantOf(item.Url, item.ParentUrl);
+
+        var score = 0;
+        if (isRoot) score += 10_000;
+        if (hasParent) score += 1_000;
+        if (hasParent && !parentKey.Equals(canonicalStart, StringComparison.OrdinalIgnoreCase)) score += 500;
+        if (!isRoot && item.Depth > 0) score += 200;
+        if (!isRoot && item.Depth == 0) score -= 1_000;
+        score += CountUrlPathSegments(item.ParentUrl) * 20;
+        score += Math.Min(100, TitleScore(item));
+        return score;
+    }
+
+    private static int TitleScore(NavItem item)
+    {
+        var title = (item.Title ?? "").Trim();
+        if (title.Length == 0) return 0;
+        if (title.Equals(item.Url, StringComparison.OrdinalIgnoreCase)) return 1;
+        return Math.Min(title.Length, 200);
+    }
+
+    private static List<NavItem> RecalculateDepths(
+        List<NavItem> flat,
+        string startUrl,
+        Logger? log)
+    {
+        var canonicalStart = CanonicalUrlKey(startUrl);
+        var byKey = new Dictionary<string, NavItem>(StringComparer.OrdinalIgnoreCase);
+        foreach (var item in flat)
+        {
+            var key = CanonicalUrlKey(item.Url);
+            if (!string.IsNullOrWhiteSpace(key) && !byKey.ContainsKey(key))
+                byKey[key] = item;
+        }
+
+        var depthByKey = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var cyclesBroken = 0;
+
+        int DepthFor(string key, HashSet<string> path)
+        {
+            if (depthByKey.TryGetValue(key, out var cached))
+                return cached;
+
+            if (!byKey.TryGetValue(key, out var item))
+                return 0;
+
+            if (key.Equals(canonicalStart, StringComparison.OrdinalIgnoreCase))
+            {
+                item.ParentUrl = "";
+                return depthByKey[key] = 0;
+            }
+
+            if (!path.Add(key))
+            {
+                item.ParentUrl = byKey.TryGetValue(canonicalStart, out var startItem)
+                    ? startItem.Url
+                    : startUrl;
+                cyclesBroken++;
+                log?.Event("DEPTH_RECALC_CYCLE_BROKEN", ("url", item.Url));
+                return depthByKey[key] = 1;
+            }
+
+            var parentKey = CanonicalUrlKey(item.ParentUrl);
+            if (string.IsNullOrWhiteSpace(parentKey)
+                || parentKey.Equals(key, StringComparison.OrdinalIgnoreCase)
+                || !byKey.ContainsKey(parentKey))
+            {
+                parentKey = FindNearestKnownAncestorKey(item.Url, byKey.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase), canonicalStart)
+                    ?? canonicalStart;
+
+                item.ParentUrl = byKey.TryGetValue(parentKey, out var inferredParent)
+                    ? inferredParent.Url
+                    : startUrl;
+            }
+
+            var depth = 1 + DepthFor(parentKey, path);
+            path.Remove(key);
+            return depthByKey[key] = depth;
+        }
+
+        var changed = 0;
+        foreach (var item in flat)
+        {
+            var key = CanonicalUrlKey(item.Url);
+            var oldDepth = item.Depth;
+            item.Depth = DepthFor(key, new HashSet<string>(StringComparer.OrdinalIgnoreCase));
+            if (item.Depth != oldDepth) changed++;
+        }
+
+        log?.Event("DEPTH_RECALCULATED",
+            ("items", flat.Count),
+            ("changed", changed),
+            ("cyclesBroken", cyclesBroken),
+            ("maxDepth", flat.Count > 0 ? flat.Max(x => x.Depth) : 0));
+
+        return flat;
+    }
+
+    private static NavItem CloneWithCanonicalUrls(NavItem item)
+    {
+        return new NavItem
+        {
+            Url = CanonicalDisplayUrl(item.Url),
+            Title = item.Title ?? "",
+            Depth = item.Depth,
+            ParentUrl = string.IsNullOrWhiteSpace(item.ParentUrl) ? "" : CanonicalDisplayUrl(item.ParentUrl),
+            IsExternal = item.IsExternal,
+            IsJsDynamic = item.IsJsDynamic,
+            IsDisplayOnly = item.IsDisplayOnly
+        };
+    }
+
+    private static string? FindNearestKnownAncestorKey(
+        string url,
+        HashSet<string> knownKeys,
+        string canonicalStart)
+    {
+        if (!Uri.TryCreate(CanonicalDisplayUrl(url), UriKind.Absolute, out var u))
+            return null;
+
+        var segments = u.AbsolutePath.TrimEnd('/').Split('/', StringSplitOptions.RemoveEmptyEntries);
+        if (segments.Length < 2) return null;
+
+        for (int i = segments.Length - 1; i >= 1; i--)
+        {
+            var ancestorPath = "/" + string.Join("/", segments, 0, i);
+            var ancestor = CanonicalUrlKey($"{u.Scheme}://{u.Host}{ancestorPath}");
+            if (ancestor.Equals(canonicalStart, StringComparison.OrdinalIgnoreCase))
+                return null;
+            if (knownKeys.Contains(ancestor))
+                return ancestor;
+        }
+
+        return null;
+    }
+
+    private static string CanonicalUrlKey(string? url)
+        => CanonicalDisplayUrl(url).ToLowerInvariant();
+
+    private static string CanonicalDisplayUrl(string? url)
+    {
+        if (string.IsNullOrWhiteSpace(url)) return "";
+
+        try
+        {
+            var u = new Uri(url.Trim(), UriKind.Absolute);
+            var builder = new UriBuilder(u)
+            {
+                Scheme = u.Scheme.ToLowerInvariant(),
+                Host = u.Host.ToLowerInvariant(),
+                Query = "",
+                Fragment = ""
+            };
+
+            if ((builder.Scheme == "http" && builder.Port == 80)
+                || (builder.Scheme == "https" && builder.Port == 443))
+                builder.Port = -1;
+
+            var result = builder.Uri.GetLeftPart(UriPartial.Path);
+            return result.TrimEnd('/');
+        }
+        catch
+        {
+            return (url ?? "").Trim().TrimEnd('/');
+        }
+    }
+
+    /// <summary>
+    /// Walks up the URL path one segment at a time (most-specific first) and returns
+    /// the URL of the first ancestor found in <paramref name="knownUrls"/>.
+    /// Returns null when no known ancestor exists other than the site root itself.
+    /// </summary>
+    private static string? FindNearestKnownAncestorUrl(
+        string url,
+        Dictionary<string, NavItem> knownUrls,
+        string startUrl)
+    {
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var u)) return null;
+
+        var segments = u.AbsolutePath.TrimEnd('/').Split('/', StringSplitOptions.RemoveEmptyEntries);
+
+        // Need ≥ 2 segments for there to be a non-root parent path.
+        if (segments.Length < 2) return null;
+
+        for (int i = segments.Length - 1; i >= 1; i--)
+        {
+            var ancestorPath = "/" + string.Join("/", segments, 0, i);
+            var ancestorUrl  = $"{u.Scheme}://{u.Host}{ancestorPath}";
+
+            if (ancestorUrl.Equals(startUrl, StringComparison.OrdinalIgnoreCase))
+                return null;
+
+            if (knownUrls.ContainsKey(ancestorUrl))
+                return ancestorUrl;
+        }
+
+        return null;
+    }
+
+    private static int CountUrlPathSegments(string url)
+    {
+        try
+        {
+            return new Uri(url).AbsolutePath
+                .TrimEnd('/')
+                .Split('/', StringSplitOptions.RemoveEmptyEntries)
+                .Length;
+        }
+        catch
+        {
+            return 0;
         }
     }
 

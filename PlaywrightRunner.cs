@@ -9,6 +9,7 @@ public sealed class PlaywrightRunner : IAsyncDisposable
 
     private IPlaywright? _playwright;
     private IBrowser? _browser;
+    private bool _browserWasReset;
 
     public PlaywrightRunner(SnapshotConfig cfg, Logger? log = null)
     {
@@ -16,7 +17,10 @@ public sealed class PlaywrightRunner : IAsyncDisposable
         _log = log;
     }
 
-    public async Task<IBrowserContext> NewContextAsync()
+    public Task<IBrowserContext> NewContextAsync()
+        => NewContextAsync(allowBrowserResetRetry: true);
+
+    private async Task<IBrowserContext> NewContextAsync(bool allowBrowserResetRetry)
     {
         try
         {
@@ -25,11 +29,22 @@ public sealed class PlaywrightRunner : IAsyncDisposable
                 _playwright = await Microsoft.Playwright.Playwright.CreateAsync();
             }
 
+            if (_browser != null && !_browser.IsConnected)
+            {
+                await ResetBrowserAsync("disconnected");
+            }
+
             if (_browser == null)
             {
                 // PLAYWRIGHT_CHROMIUM_SHELL lets the host override the headless-shell path.
                 // Useful when the default Playwright revision is broken on a specific machine.
+                // Also check User/Machine registry directly — the process env may not reflect vars
+                // set after this process tree started (e.g., set via GUI tools or SetEnvironmentVariable).
                 var shellOverride = Environment.GetEnvironmentVariable("PLAYWRIGHT_CHROMIUM_SHELL")?.Trim();
+                if (string.IsNullOrWhiteSpace(shellOverride))
+                    shellOverride = Environment.GetEnvironmentVariable("PLAYWRIGHT_CHROMIUM_SHELL", EnvironmentVariableTarget.User)?.Trim();
+                if (string.IsNullOrWhiteSpace(shellOverride))
+                    shellOverride = Environment.GetEnvironmentVariable("PLAYWRIGHT_CHROMIUM_SHELL", EnvironmentVariableTarget.Machine)?.Trim();
                 var execPath = shellOverride is { Length: > 0 } && File.Exists(shellOverride) ? shellOverride : null;
 
                 if (execPath != null)
@@ -51,6 +66,12 @@ public sealed class PlaywrightRunner : IAsyncDisposable
                         "--disable-blink-features=AutomationControlled"
                     }
                 });
+
+                if (_browserWasReset)
+                {
+                    _log?.Event("PLAYWRIGHT_BROWSER_RELAUNCHED");
+                    _browserWasReset = false;
+                }
             }
 
             var userAgent = string.IsNullOrWhiteSpace(_cfg.UserAgent)
@@ -95,6 +116,12 @@ public sealed class PlaywrightRunner : IAsyncDisposable
                     "Original Playwright error:\n" + msg, ex);
             }
 
+            if (allowBrowserResetRetry && LooksLikeClosedBrowser(msg))
+            {
+                await ResetBrowserAsync(ex.GetType().Name);
+                return await NewContextAsync(allowBrowserResetRetry: false);
+            }
+
             _log?.Error("[PLAYWRIGHT] " + msg);
             throw;
         }
@@ -107,6 +134,23 @@ public sealed class PlaywrightRunner : IAsyncDisposable
         var page = await ctx.NewPageAsync();
         await WirePageDefaultsAsync(page);
         return page;
+    }
+
+    public async Task ResetBrowserAsync(string reason = "")
+    {
+        _log?.Event("PLAYWRIGHT_BROWSER_RESET", ("reason", reason ?? ""));
+
+        try
+        {
+            if (_browser != null)
+                await _browser.CloseAsync();
+        }
+        catch { }
+        finally
+        {
+            _browser = null;
+            _browserWasReset = true;
+        }
     }
 
     private async Task WireContextDefaultsAsync(IBrowserContext ctx)
@@ -487,6 +531,15 @@ async () => {
             || msg.Contains("run playwright install")
             || msg.Contains("playwright was just installed")
             || msg.Contains("browser has been closed") && msg.Contains("executable");
+    }
+
+    private static bool LooksLikeClosedBrowser(string msg)
+    {
+        msg = (msg ?? "").ToLowerInvariant();
+        return msg.Contains("target page, context or browser has been closed")
+            || msg.Contains("browser has been closed")
+            || msg.Contains("browser is closed")
+            || msg.Contains("targetclosed");
     }
 
     private static string GetInstallHint()

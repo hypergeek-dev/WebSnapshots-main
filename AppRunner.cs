@@ -69,11 +69,11 @@ public static class AppRunner
         ct.ThrowIfCancellationRequested();
         pause.WaitIfPaused(ct);
 
-        // Top index
+        // Top index (written into the run's _runs/{runId}/ folder)
         using (log.Scope("BUILD_TOP_INDEX"))
         {
             var indexBuilder = new TopIndexBuilder(cfg);
-            await indexBuilder.BuildAsync(cfg.OutputDir, runId, results.ToList());
+            await indexBuilder.BuildAsync(runDir, runId, results.ToList());
         }
 
         // Build per-municipality indexes (index.html + index.json)
@@ -108,7 +108,7 @@ public static class AppRunner
                 PagesDone = r.PagesDone
             }).ToList()
         };
-        await Utils.WriteJsonAsync(Path.Combine(cfg.OutputDir, "run.json"), manifest);
+        await Utils.WriteJsonAsync(Path.Combine(runDir, "run.json"), manifest);
 
         // Base/global index (unchanged behavior)
         await GlobalIndexBuilder.BuildAsync(cfg.OutputBaseDir);
@@ -260,6 +260,8 @@ public static class AppRunner
             status = "CAP_REACHED";
             siteLog.Error("Storage cap reached: " + ex.Message);
             uiLog($"[SITE] STOP {host} (storage cap reached)");
+            pagesDone = CountActualShots(siteDir, pagesDone);
+            await TryBuildViewerAsync(siteDir, host, startUrl, pagesDone, cfg, siteLog);
             results.Add((host, municipality, $"{municipality}/{scrapeFolderName}/index.html", status, pagesDone));
         }
         catch (Exception ex)
@@ -267,6 +269,8 @@ public static class AppRunner
             status = "ERROR";
             siteLog.Error("Unhandled exception: " + ex);
             uiLog($"[SITE] ERROR {host}: {ex.Message}");
+            pagesDone = CountActualShots(siteDir, pagesDone);
+            await TryBuildViewerAsync(siteDir, host, startUrl, pagesDone, cfg, siteLog);
             results.Add((host, municipality, $"{municipality}/{scrapeFolderName}/index.html", status, pagesDone));
         }
         finally
@@ -275,6 +279,29 @@ public static class AppRunner
             uiLog($"[SITE] DONE  {host} status={status} pagesCaptured={pagesDone}");
             uiLog("");
         }
+    }
+
+    private static int CountActualShots(string siteDir, int currentPagesDone)
+    {
+        try
+        {
+            var shotsDir = Path.Combine(siteDir, "shots");
+            if (!Directory.Exists(shotsDir)) return currentPagesDone;
+            var count = Directory.GetFiles(shotsDir, "*.webp", SearchOption.TopDirectoryOnly).Length;
+            return count > currentPagesDone ? count : currentPagesDone;
+        }
+        catch { return currentPagesDone; }
+    }
+
+    private static async Task TryBuildViewerAsync(string siteDir, string host, string startUrl, int pagesDone, SnapshotConfig cfg, Logger siteLog)
+    {
+        if (pagesDone <= 0) return;
+        try
+        {
+            var viewer = new SiteViewerBuilder(cfg, siteLog);
+            await viewer.BuildAsync(siteDir, host, startUrl);
+        }
+        catch { }
     }
 
     private static string BuildScrapeEntryHtml(string municipality, string host, string startUrl, string status, int pagesDone, string viewerRel)

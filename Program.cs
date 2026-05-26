@@ -221,7 +221,7 @@ public static class Program
         using (log.Scope("BUILD_TOP_INDEX"))
         {
             var indexBuilder = new TopIndexBuilder(cfg);
-            await indexBuilder.BuildAsync(cfg.OutputDir, runId, results.ToList());
+            await indexBuilder.BuildAsync(runDir, runId, results.ToList());
         }
 
         var manifest = new RunManifest
@@ -241,7 +241,7 @@ public static class Program
             }).ToList()
         };
 
-        await Utils.WriteJsonAsync(Path.Combine(cfg.OutputDir, "run.json"), manifest);
+        await Utils.WriteJsonAsync(Path.Combine(runDir, "run.json"), manifest);
 
         await GlobalIndexBuilder.BuildAsync(cfg.OutputBaseDir);
 
@@ -267,7 +267,7 @@ public static class Program
         var municipality = Utils.HostToMunicipality(host);
 
         // Scrape folder: {OutputDir}/{Municipality}/{yyMMddHHmm}
-        var scrapeFolderName = DateTimeOffset.Now.ToString("yyMMddHHmm", CultureInfo.InvariantCulture);
+        var scrapeFolderName = DateTimeOffset.Now.ToString("yyMMdd", CultureInfo.InvariantCulture);
         var scrapeRootDir = Path.Combine(cfg.OutputDir, municipality, scrapeFolderName);
 
         // Deduplicate if folder already exists (rare but possible)
@@ -344,6 +344,8 @@ public static class Program
             status = "CAP_REACHED";
             siteLog.Error("Storage cap reached: " + ex.Message);
             uiLog($"[SITE] STOP {host} (storage cap reached)");
+            pagesDone = CountActualShots(siteDir, pagesDone);
+            await TryBuildViewerAsync(siteDir, host, startUrl, pagesDone, cfg, siteLog);
             results.Add((host, municipality, $"{municipality}/{scrapeFolderName}/index.htm", status, pagesDone));
         }
         catch (Exception ex)
@@ -351,6 +353,8 @@ public static class Program
             status = "ERROR";
             siteLog.Error("Unhandled exception: " + ex);
             uiLog($"[SITE] ERROR {host}: {ex.Message}");
+            pagesDone = CountActualShots(siteDir, pagesDone);
+            await TryBuildViewerAsync(siteDir, host, startUrl, pagesDone, cfg, siteLog);
             results.Add((host, municipality, $"{municipality}/{scrapeFolderName}/index.htm", status, pagesDone));
         }
         finally
@@ -359,6 +363,29 @@ public static class Program
             uiLog($"[SITE] DONE  {host} status={status} pagesCaptured={pagesDone}");
             uiLog("");
         }
+    }
+
+    private static int CountActualShots(string siteDir, int currentPagesDone)
+    {
+        try
+        {
+            var shotsDir = Path.Combine(siteDir, "shots");
+            if (!Directory.Exists(shotsDir)) return currentPagesDone;
+            var count = Directory.GetFiles(shotsDir, "*.webp", SearchOption.TopDirectoryOnly).Length;
+            return count > currentPagesDone ? count : currentPagesDone;
+        }
+        catch { return currentPagesDone; }
+    }
+
+    private static async Task TryBuildViewerAsync(string siteDir, string host, string startUrl, int pagesDone, SnapshotConfig cfg, Logger siteLog)
+    {
+        if (pagesDone <= 0) return;
+        try
+        {
+            var viewer = new SiteViewerBuilder(cfg, siteLog);
+            await viewer.BuildAsync(siteDir, host, startUrl);
+        }
+        catch { }
     }
 
     private static string ResolveSitesPath(string sitesPathWork, string sitesPathBin)

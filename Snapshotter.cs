@@ -14,6 +14,8 @@ public sealed class Snapshotter
     private const int STABILITY_THRESHOLD = 3;
     private const int LAZY_LOAD_DELAY_MS = 120;
     private const int POST_DECODE_DELAY_MS = 150;
+    private const int BLANK_PNG_THRESHOLD_BYTES = 20_000;
+    private const int CONSENT_SETTLE_MS = 1_200;
 
     private readonly SnapshotConfig _cfg;
     private readonly PlaywrightRunner _runner;
@@ -135,227 +137,309 @@ public sealed class Snapshotter
             }
         }
 
-        await using var ctx = await _runner.NewContextAsync();
+        IBrowserContext? ctx = await _runner.NewContextAsync();
         var textExtractor = new TextExtractor(_log);
 
         int capturedPages = 0;
+        int failedPages = 0;
 
-        foreach (var it in flat)
+        try
         {
-            ct.ThrowIfCancellationRequested();
-            pause.WaitIfPaused(ct);
-
-            var totalBytes = Utils.GetDirectorySizeBytes(_cfg.OutputDir);
-            governor.ThrowIfOverCap(totalBytes);
-
-            if (capturedPages >= _cfg.MaxPagesPerSite) break;
-
-            var url = Utils.NormalizeUrl(it.Url, _cfg.DropQueryStrings);
-            var safeBase = Utils.SafeFileBaseFromUrl(url);
-
-            var outHtml = Path.Combine(pagesDir, safeBase + ".htm");
-            var outTextHtml = Path.Combine(pagesDir, safeBase + ".text.htm");
-
-            if (File.Exists(outHtml))
-            {
-                _log?.Event("SHOT_SKIP_EXISTS", ("host", host), ("url", url), ("page", outHtml));
-                capturedPages++;
-                continue;
-            }
-
-            _log?.Event("SHOT_START", ("host", host), ("idx", capturedPages + 1), ("max", _cfg.MaxPagesPerSite), ("url", url));
-            Console.WriteLine($"[SHOT] {host} {capturedPages + 1}/{_cfg.MaxPagesPerSite} {url}");
-
-            var page = await ctx.NewPageAsync();
-
-            try
+            foreach (var it in flat)
             {
                 ct.ThrowIfCancellationRequested();
                 pause.WaitIfPaused(ct);
 
-                using (_log?.Scope("SHOT_PAGE", ("url", url)) ?? DummyDisposable.Instance)
+                var totalBytes = Utils.GetDirectorySizeBytes(_cfg.OutputDir);
+                governor.ThrowIfOverCap(totalBytes);
+
+                if (capturedPages >= _cfg.MaxPagesPerSite) break;
+
+                var url = Utils.NormalizeUrl(it.Url, _cfg.DropQueryStrings);
+                var safeBase = Utils.SafeFileBaseFromUrl(url);
+
+                var outHtml = Path.Combine(pagesDir, safeBase + ".htm");
+                var outTextHtml = Path.Combine(pagesDir, safeBase + ".text.htm");
+
+                if (File.Exists(outHtml))
                 {
-                    await page.GotoAsync(url, new PageGotoOptions
-                    {
-                        WaitUntil = WaitUntilState.DOMContentLoaded,
-                        Timeout = _cfg.ShotGotoTimeoutMs
-                    });
+                    _log?.Event("SHOT_SKIP_EXISTS", ("host", host), ("url", url), ("page", outHtml));
+                    capturedPages++;
+                    continue;
+                }
 
+                _log?.Event("SHOT_START", ("host", host), ("idx", capturedPages + 1), ("max", _cfg.MaxPagesPerSite), ("url", url));
+                Console.WriteLine($"[SHOT] {host} {capturedPages + 1}/{_cfg.MaxPagesPerSite} {url}");
+
+                IPage? page = null;
+
+                try
+                {
                     ct.ThrowIfCancellationRequested();
                     pause.WaitIfPaused(ct);
 
-                    try
+                    ctx = await EnsureSnapshotContextAsync(ctx, host, ct);
+                    page = await ctx.NewPageAsync();
+
+                    using (_log?.Scope("SHOT_PAGE", ("url", url)) ?? DummyDisposable.Instance)
                     {
-                        await page.WaitForLoadStateAsync(LoadState.NetworkIdle, new PageWaitForLoadStateOptions
+                        await page.GotoAsync(url, new PageGotoOptions
                         {
-                            Timeout = _cfg.NetworkIdleMaxMs
+                            WaitUntil = WaitUntilState.DOMContentLoaded,
+                            Timeout = _cfg.ShotGotoTimeoutMs
                         });
-                    }
-                    catch (Exception ex)
-                    {
-                        if (_cfg.Debug)
-                            _log?.Event("NETWORK_IDLE_TIMEOUT", ("url", url), ("error", ex.Message));
-                    }
-
-                    ct.ThrowIfCancellationRequested();
-                    pause.WaitIfPaused(ct);
-
-                    TextContent textContent;
-                    using (_log?.Scope("TEXT_EXTRACT", ("url", url)) ?? DummyDisposable.Instance)
-                    {
-                        try
-                        {
-                            textContent = await textExtractor.ExtractAsync(page, url);
-                            _log?.Event("TEXT_EXTRACTED", ("url", url), ("sections", textContent.Sections.Count), ("links", textContent.Links.Count));
-                            _telemetry?.Emit(TelemetryPhase.TextExtract, "text_extracted", TelemetrySeverity.Info,
-                                url, new Dictionary<string, object?>
-                                {
-                                    ["titleLength"] = textContent.Title?.Length ?? 0,
-                                    ["descriptionLength"] = textContent.Description?.Length ?? 0,
-                                    ["sectionCount"] = textContent.Sections.Count,
-                                    ["linkCount"] = textContent.Links.Count
-                                });
-                        }
-                        catch (Exception texEx)
-                        {
-                            _log?.Warn($"TEXT_EXTRACT_FAIL url={url} err={texEx.Message}");
-                            _telemetry?.Emit(TelemetryPhase.TextExtract, "text_extract_fail", TelemetrySeverity.Warning,
-                                url, new Dictionary<string, object?> { ["errorKind"] = texEx.GetType().Name });
-                            textContent = new TextContent { Title = it.Title ?? "", Url = url };
-                        }
-                    }
-
-                    ct.ThrowIfCancellationRequested();
-                    pause.WaitIfPaused(ct);
-
-                    List<string> images;
-                    bool usedSingle = false;
-
-                    if (!_skipScreenshots)
-                    {
-                        await EnhanceForSnapshotAsync(page);
 
                         ct.ThrowIfCancellationRequested();
                         pause.WaitIfPaused(ct);
 
                         try
                         {
-                            images = await CaptureSingleAsWebpAsync(page, shotsDir, safeBase, governor, ct, pause);
-                            usedSingle = true;
+                            await page.WaitForLoadStateAsync(LoadState.NetworkIdle, new PageWaitForLoadStateOptions
+                            {
+                                Timeout = _cfg.NetworkIdleMaxMs
+                            });
                         }
-                        catch (Exception exSingle)
+                        catch (Exception ex)
                         {
-                            _log?.Warn($"SHOT_SINGLE_FAIL url={url} err={exSingle.Message}");
-                            images = await CaptureTilesAsWebpAsync(page, shotsDir, safeBase, governor, ct, pause);
+                            if (_cfg.Debug)
+                                _log?.Event("NETWORK_IDLE_TIMEOUT", ("url", url), ("error", ex.Message));
                         }
+
+                        ct.ThrowIfCancellationRequested();
+                        pause.WaitIfPaused(ct);
+
+                        TextContent textContent;
+                        using (_log?.Scope("TEXT_EXTRACT", ("url", url)) ?? DummyDisposable.Instance)
+                        {
+                            try
+                            {
+                                textContent = await textExtractor.ExtractAsync(page, url);
+                                _log?.Event("TEXT_EXTRACTED", ("url", url), ("sections", textContent.Sections.Count), ("links", textContent.Links.Count));
+                                _telemetry?.Emit(TelemetryPhase.TextExtract, "text_extracted", TelemetrySeverity.Info,
+                                    url, new Dictionary<string, object?>
+                                    {
+                                        ["titleLength"] = textContent.Title?.Length ?? 0,
+                                        ["descriptionLength"] = textContent.Description?.Length ?? 0,
+                                        ["sectionCount"] = textContent.Sections.Count,
+                                        ["linkCount"] = textContent.Links.Count
+                                    });
+                            }
+                            catch (Exception texEx)
+                            {
+                                _log?.Warn($"TEXT_EXTRACT_FAIL url={url} err={texEx.Message}");
+                                _telemetry?.Emit(TelemetryPhase.TextExtract, "text_extract_fail", TelemetrySeverity.Warning,
+                                    url, new Dictionary<string, object?> { ["errorKind"] = texEx.GetType().Name });
+                                textContent = new TextContent { Title = it.Title ?? "", Url = url };
+                            }
+                        }
+
+                        ct.ThrowIfCancellationRequested();
+                        pause.WaitIfPaused(ct);
+
+                        List<string> images;
+                        bool usedSingle = false;
+
+                        if (!_skipScreenshots)
+                        {
+                            await EnhanceForSnapshotAsync(page);
+
+                            ct.ThrowIfCancellationRequested();
+                            pause.WaitIfPaused(ct);
+
+                            try
+                            {
+                                images = await CaptureSingleAsWebpAsync(page, shotsDir, safeBase, url, governor, ct, pause);
+                                usedSingle = true;
+                            }
+                            catch (Exception exSingle)
+                            {
+                                _log?.Warn($"SHOT_SINGLE_FAIL url={url} err={exSingle.Message}");
+                                images = await CaptureTilesAsWebpAsync(page, shotsDir, safeBase, governor, ct, pause);
+                            }
+                        }
+                        else
+                        {
+                            images = new List<string>();
+                        }
+
+                        ct.ThrowIfCancellationRequested();
+                        pause.WaitIfPaused(ct);
+
+                        var title = (await page.TitleAsync())?.Trim();
+                        if (string.IsNullOrWhiteSpace(title)) title = it.Title;
+                        if (string.IsNullOrWhiteSpace(title)) title = url;
+
+                        string? prevHref = null;
+                        string? nextHref = null;
+
+                        if (prevMap.TryGetValue(url, out var p) && !string.IsNullOrWhiteSpace(p))
+                            prevHref = $"./{Utils.SafeFileBaseFromUrl(p!)}.htm";
+
+                        if (nextMap.TryGetValue(url, out var n) && !string.IsNullOrWhiteSpace(n))
+                            nextHref = $"./{Utils.SafeFileBaseFromUrl(n!)}.htm";
+
+                        var pageHtml = PageHtmlBuilder.Build(
+                            title: title!,
+                            sourceUrl: url,
+                            tileRelPaths: images,
+                            overlapPx: usedSingle ? 0 : _cfg.TileOverlapPx,
+                            textViewHref: safeBase + ".text.htm",
+                            error: null,
+                            topNavLinks: topNavLinks,
+                            prevHref: prevHref,
+                            nextHref: nextHref
+                        );
+
+                        await AtomicWrite.WriteAllTextAtomicAsync(outHtml, pageHtml, Encoding.UTF8);
+
+                        var textPageHtml = TextPageBuilder.Build(textContent, safeBase + ".htm");
+                        await AtomicWrite.WriteAllTextAtomicAsync(outTextHtml, textPageHtml, Encoding.UTF8);
+
+                        _log?.Event("SHOT_OK",
+                            ("url", url),
+                            ("mode", usedSingle ? "single" : "tiles"),
+                            ("images", images.Count),
+                            ("page", outHtml),
+                            ("textPage", outTextHtml));
+
+                        _telemetry?.Emit(TelemetryPhase.Snapshot, "snapshot_success", TelemetrySeverity.Info,
+                            url, new Dictionary<string, object?>
+                            {
+                                ["imageCount"] = images.Count,
+                                ["mode"] = _skipScreenshots ? "text-only" : (usedSingle ? "single" : "tiled"),
+                                ["index"] = capturedPages + 1
+                            });
+
+                        capturedPages++;
+
+                        if (_cfg.DelayBetweenPagesMs > 0)
+                            await Task.Delay(_cfg.DelayBetweenPagesMs, ct);
                     }
-                    else
-                    {
-                        images = new List<string>();
-                    }
-
-                    ct.ThrowIfCancellationRequested();
-                    pause.WaitIfPaused(ct);
-
-                    var title = (await page.TitleAsync())?.Trim();
-                    if (string.IsNullOrWhiteSpace(title)) title = it.Title;
-                    if (string.IsNullOrWhiteSpace(title)) title = url;
-
-                    string? prevHref = null;
-                    string? nextHref = null;
-
-                    if (prevMap.TryGetValue(url, out var p) && !string.IsNullOrWhiteSpace(p))
-                        prevHref = $"./{Utils.SafeFileBaseFromUrl(p!)}.htm";
-
-                    if (nextMap.TryGetValue(url, out var n) && !string.IsNullOrWhiteSpace(n))
-                        nextHref = $"./{Utils.SafeFileBaseFromUrl(n!)}.htm";
-
-                    var pageHtml = PageHtmlBuilder.Build(
-                        title: title!,
-                        sourceUrl: url,
-                        tileRelPaths: images,
-                        overlapPx: usedSingle ? 0 : _cfg.TileOverlapPx,
-                        textViewHref: safeBase + ".text.htm",
-                        error: null,
-                        topNavLinks: topNavLinks,
-                        prevHref: prevHref,
-                        nextHref: nextHref
-                    );
-
-                    await AtomicWrite.WriteAllTextAtomicAsync(outHtml, pageHtml, Encoding.UTF8);
-
-                    var textPageHtml = TextPageBuilder.Build(textContent, safeBase + ".htm");
-                    await AtomicWrite.WriteAllTextAtomicAsync(outTextHtml, textPageHtml, Encoding.UTF8);
-
-                    _log?.Event("SHOT_OK",
+                }
+                catch (OperationCanceledException)
+                {
+                    _log?.Warn($"SHOT_CANCELLED url={url}");
+                    throw;
+                }
+                catch (StorageCapReachedException)
+                {
+                    _log?.Warn($"SHOT_CAP_REACHED url={url}");
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    _log?.Error($"SHOT_FAIL url={url} err={ex}");
+                    _log?.Event("SNAPSHOT_PAGE_FAILED_CONTINUED",
+                        ("host", host),
                         ("url", url),
-                        ("mode", usedSingle ? "single" : "tiles"),
-                        ("images", images.Count),
-                        ("page", outHtml),
-                        ("textPage", outTextHtml));
-
-                    _telemetry?.Emit(TelemetryPhase.Snapshot, "snapshot_success", TelemetrySeverity.Info,
+                        ("errorKind", ex.GetType().Name),
+                        ("error", ex.Message));
+                    Console.WriteLine($"[SHOT] warn {url}: {ex.Message}");
+                    _telemetry?.Emit(TelemetryPhase.Snapshot, "snapshot_fail", TelemetrySeverity.Warning,
                         url, new Dictionary<string, object?>
                         {
-                            ["imageCount"] = images.Count,
-                            ["mode"] = _skipScreenshots ? "text-only" : (usedSingle ? "single" : "tiled"),
-                            ["index"] = capturedPages + 1
+                            ["errorKind"] = ex is TimeoutException ? "timeout" : ex.GetType().Name,
+                            ["error"] = ex.Message
                         });
 
-                    capturedPages++;
+                    var stub = PageHtmlBuilder.Build(
+                        title: $"FAILED: {it.Title}",
+                        sourceUrl: url,
+                        tileRelPaths: new List<string>(),
+                        overlapPx: _cfg.TileOverlapPx,
+                        textViewHref: null,
+                        error: ex.Message,
+                        topNavLinks: topNavLinks,
+                        prevHref: null,
+                        nextHref: null
+                    );
 
-                    if (_cfg.DelayBetweenPagesMs > 0)
-                        await Task.Delay(_cfg.DelayBetweenPagesMs, ct);
+                    await AtomicWrite.WriteAllTextAtomicAsync(outHtml, stub, Encoding.UTF8);
+                    capturedPages++;
+                    failedPages++;
+
+                    if (IsTargetClosed(ex))
+                    {
+                        try
+                        {
+                            ctx = await RecreateSnapshotContextAsync(ctx, host, ct);
+                        }
+                        catch (Exception recoverEx)
+                        {
+                            _log?.Event("SNAPSHOT_BROWSER_RECOVERY_FAILED",
+                                ("host", host),
+                                ("url", url),
+                                ("errorKind", recoverEx.GetType().Name),
+                                ("error", recoverEx.Message));
+                            throw;
+                        }
+                    }
+                }
+                finally
+                {
+                    if (page != null)
+                    {
+                        try { await page.CloseAsync(); } catch { }
+                    }
                 }
             }
-            catch (OperationCanceledException)
+        }
+        finally
+        {
+            if (ctx != null)
             {
-                _log?.Warn($"SHOT_CANCELLED url={url}");
-                throw;
-            }
-            catch (StorageCapReachedException)
-            {
-                _log?.Warn($"SHOT_CAP_REACHED url={url}");
-                throw;
-            }
-            catch (Exception ex)
-            {
-                _log?.Error($"SHOT_FAIL url={url} err={ex}");
-                Console.WriteLine($"[SHOT] warn {url}: {ex.Message}");
-                _telemetry?.Emit(TelemetryPhase.Snapshot, "snapshot_fail", TelemetrySeverity.Warning,
-                    url, new Dictionary<string, object?>
-                    {
-                        ["errorKind"] = ex is TimeoutException ? "timeout" : ex.GetType().Name,
-                        ["error"] = ex.Message
-                    });
-
-                var stub = PageHtmlBuilder.Build(
-                    title: $"FAILED: {it.Title}",
-                    sourceUrl: url,
-                    tileRelPaths: new List<string>(),
-                    overlapPx: _cfg.TileOverlapPx,
-                    textViewHref: null,
-                    error: ex.Message,
-                    topNavLinks: topNavLinks,
-                    prevHref: null,
-                    nextHref: null
-                );
-
-                await AtomicWrite.WriteAllTextAtomicAsync(outHtml, stub, Encoding.UTF8);
-                capturedPages++;
-            }
-            finally
-            {
-                try { await page.CloseAsync(); } catch { }
+                try { await ctx.DisposeAsync(); } catch { }
             }
         }
 
-        _log?.Event("SHOT_DONE", ("host", host), ("capturedPages", capturedPages));
+        _log?.Event("SHOT_DONE", ("host", host), ("capturedPages", capturedPages), ("failedPages", failedPages));
         return capturedPages;
+    }
+
+    private async Task<IBrowserContext> EnsureSnapshotContextAsync(IBrowserContext? ctx, string host, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+
+        if (ctx != null)
+            return ctx;
+
+        return await RecreateSnapshotContextAsync(null, host, ct);
+    }
+
+    private async Task<IBrowserContext> RecreateSnapshotContextAsync(IBrowserContext? ctx, string host, CancellationToken ct)
+    {
+        if (ctx != null)
+        {
+            try { await ctx.DisposeAsync(); } catch { }
+        }
+
+        ct.ThrowIfCancellationRequested();
+        await _runner.ResetBrowserAsync("snapshot_target_closed");
+        ct.ThrowIfCancellationRequested();
+
+        var fresh = await _runner.NewContextAsync();
+        _log?.Event("SNAPSHOT_BROWSER_RECOVERED", ("host", host));
+        return fresh;
+    }
+
+    private static bool IsTargetClosed(Exception ex)
+    {
+        for (var cur = ex; cur != null; cur = cur.InnerException!)
+        {
+            var name = cur.GetType().Name;
+            if (name.Contains("TargetClosed", StringComparison.OrdinalIgnoreCase))
+                return true;
+            if ((cur.Message ?? "").Contains("Target page, context or browser has been closed", StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+
+        return false;
     }
 
     private async Task EnhanceForSnapshotAsync(IPage page)
     {
+        await TryAcceptCookieConsentAsync(page);
+
         try
         {
             await page.EvaluateAsync(@"
@@ -579,6 +663,7 @@ async (params) => {
         IPage page,
         string shotsDirAbs,
         string safeBase,
+        string url,
         StorageGovernor governor,
         CancellationToken ct,
         PauseController pause)
@@ -596,6 +681,18 @@ async (params) => {
                 _log?.Event("PRE_SCREENSHOT_TIMEOUT", ("error", ex.Message));
         }
 
+        // Readiness check: if body text is suspiciously short the page may not have settled
+        try
+        {
+            var bodyLen = await page.EvaluateAsync<int>("() => (document.body?.innerText?.length ?? 0)");
+            if (bodyLen < 100)
+            {
+                _log?.Event("SCREENSHOT_READINESS_WAIT", ("url", url), ("bodyLen", bodyLen));
+                await page.WaitForTimeoutAsync(800);
+            }
+        }
+        catch { }
+
         ct.ThrowIfCancellationRequested();
         pause.WaitIfPaused(ct);
 
@@ -604,6 +701,35 @@ async (params) => {
             FullPage = true,
             Type = ScreenshotType.Png
         });
+
+        // Blank-screenshot guard: if PNG is suspiciously small, retry once after another consent attempt
+        if (png.Length <= BLANK_PNG_THRESHOLD_BYTES)
+        {
+            _log?.Event("BLANK_SCREENSHOT_DETECTED", ("url", url), ("bytesPng", png.Length));
+
+            await TryAcceptCookieConsentAsync(page);
+            await page.WaitForTimeoutAsync(1_000);
+
+            _log?.Event("SCREENSHOT_RETRY", ("url", url));
+
+            ct.ThrowIfCancellationRequested();
+            pause.WaitIfPaused(ct);
+
+            png = await page.ScreenshotAsync(new PageScreenshotOptions
+            {
+                FullPage = true,
+                Type = ScreenshotType.Png
+            });
+
+            if (png.Length <= BLANK_PNG_THRESHOLD_BYTES)
+                _log?.Event("SCREENSHOT_STILL_BLANK", ("url", url), ("bytesPng", png.Length));
+            else
+                _log?.Event("SCREENSHOT_READY", ("url", url), ("bytesPng", png.Length));
+        }
+        else
+        {
+            _log?.Event("SCREENSHOT_READY", ("url", url), ("bytesPng", png.Length));
+        }
 
         ct.ThrowIfCancellationRequested();
         pause.WaitIfPaused(ct);
@@ -622,6 +748,7 @@ async (params) => {
         File.Move(tmpAbs, outAbs, overwrite: true);
 
         _log?.Event("SHOT_SINGLE",
+            ("url", url),
             ("base", safeBase),
             ("file", fileName),
             ("bytesPng", png.Length)
@@ -737,6 +864,43 @@ async (params) => {
         try { await page.EvaluateAsync("(yy) => window.scrollTo(0, yy)", 0); } catch { }
 
         return rels;
+    }
+
+    private async Task<bool> TryAcceptCookieConsentAsync(IPage page)
+    {
+        // Ordered from most specific to least specific to avoid false positives.
+        // Swedish (Municipio/Pressidium) and English consent patterns.
+        var patterns = new[]
+        {
+            "acceptera alla", "godkänn alla", "tillåt alla",
+            "accept all", "allow all", "allow cookies",
+            "acceptera", "godkänn", "jag förstår", "accept"
+        };
+
+        foreach (var pat in patterns)
+        {
+            try
+            {
+                // :has-text() in Playwright does case-insensitive substring matching
+                var selector = $"button:has-text(\"{pat}\"), [role='button']:has-text(\"{pat}\")";
+                var locator = page.Locator(selector).First;
+
+                if (await locator.CountAsync() == 0) continue;
+                if (!await locator.IsVisibleAsync()) continue;
+
+                _log?.Event("COOKIE_CONSENT_CLICKED", ("url", page.Url), ("pattern", pat));
+                await locator.ClickAsync(new LocatorClickOptions { Timeout = 3_000 });
+                await page.WaitForTimeoutAsync(CONSENT_SETTLE_MS);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                if (_cfg.Debug)
+                    _log?.Event("COOKIE_CONSENT_CLICK_FAIL", ("url", page.Url), ("pattern", pat), ("error", ex.Message));
+            }
+        }
+
+        return false;
     }
 
     private sealed class DummyDisposable : IDisposable
