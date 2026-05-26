@@ -110,6 +110,72 @@ public static class QualityReportBuilder
                 report.Metrics.EmptyTitleCount = nav.Flat.Count(x => string.IsNullOrWhiteSpace(x.Title));
             }
 
+            // Root-child quality metrics
+            if (!string.IsNullOrWhiteSpace(nav.StartUrl) && nav.Flat != null)
+            {
+                report.Metrics.SyntheticParentCount = nav.Flat.Count(x => x.IsSynthetic);
+
+                // Homepage IA metrics (Phase 7)
+                report.Metrics.HomepageAnchoredSections = nav.HomepageSections?.Count ?? 0;
+                var homepageSectionUrls = (nav.HomepageSections ?? new List<HomepageSection>())
+                    .Select(hs => hs.Url)
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+                // Build child set for singleton detection (children-of-root that have their own children)
+                var urlsWithChildren = nav.Flat
+                    .Where(x => !string.IsNullOrWhiteSpace(x.ParentUrl))
+                    .Select(x => x.ParentUrl)
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+                var rootChildCount   = 0;
+                var deepRootChild    = 0;
+                var structuralRoot   = 0;
+                var utilityRoot      = 0;
+                var rawUrlTitleRoot  = 0;
+                var syntheticRoot    = 0;
+                var discoveredRoot   = 0;
+                var deepLeafRoot     = 0;
+                var singletonRoot    = 0;
+
+                foreach (var it in nav.Flat)
+                {
+                    if (string.IsNullOrWhiteSpace(it.Url)) continue;
+                    if (it.Url.Equals(nav.StartUrl, StringComparison.OrdinalIgnoreCase)) continue;
+                    if (!it.ParentUrl.Equals(nav.StartUrl, StringComparison.OrdinalIgnoreCase)) continue;
+
+                    rootChildCount++;
+
+                    var isDeep = CountNavPathSegments(it.Url) >= 2;
+                    if (isDeep) deepRootChild++;
+
+                    var isSingleton = !urlsWithChildren.Contains(it.Url);
+                    if (isSingleton) singletonRoot++;
+                    if (it.IsSynthetic) syntheticRoot++;
+                    if (IsRawUrlTitle(it.Title, it.Url)) rawUrlTitleRoot++;
+
+                    if (homepageSectionUrls.Contains(it.Url))
+                        structuralRoot++;
+                    else if (it.IsUtility)
+                        utilityRoot++;
+                    else
+                    {
+                        discoveredRoot++;
+                        if (isDeep) deepLeafRoot++;
+                    }
+                }
+
+                report.Metrics.RootChildCount         = rootChildCount;
+                report.Metrics.DeepRootChildCount      = deepRootChild;
+                report.Metrics.StructuralRootChildren  = structuralRoot;
+                report.Metrics.UtilityRootChildren     = utilityRoot;
+                report.Metrics.RawUrlTitleRootChildren = rawUrlTitleRoot;
+                report.Metrics.SyntheticRootChildren   = syntheticRoot;
+                report.Metrics.DiscoveredRootChildren  = discoveredRoot;
+                report.Metrics.DeepLeafRootChildren    = deepLeafRoot;
+                report.Metrics.SingletonRootChildren   = singletonRoot;
+                report.Metrics.RootTopologyVerdict     = GetRootTopologyVerdict(report.Metrics);
+            }
+
             // host / startUrl from nav if not set
             if (string.IsNullOrWhiteSpace(report.Host)) report.Host = nav.Host ?? "";
             if (string.IsNullOrWhiteSpace(report.StartUrl)) report.StartUrl = nav.StartUrl ?? "";
@@ -426,6 +492,80 @@ public static class QualityReportBuilder
                 m.EmptyTitleCount));
         }
 
+        // Root-child quality: a very high root-child count means the archive tree
+        // is visually unusable regardless of total page count or depth metrics.
+        if (m.RootChildCount > 50)
+        {
+            warns.Add(QualityWarning.Error("root_child_explosion",
+                $"Root node has {m.RootChildCount} direct children — tree is visually unusable. " +
+                "Expected ≤ ~20 for a well-structured municipal site.",
+                m.RootChildCount));
+            r.SuspectedFailureModes.Add("root_child_explosion");
+        }
+
+        if (m.DeepRootChildCount > 20)
+        {
+            warns.Add(QualityWarning.Error("root_leaf_pollution",
+                $"{m.DeepRootChildCount} root children have multi-segment URLs (path depth ≥ 2). " +
+                "These are leaf or article pages misplaced directly under the root node.",
+                m.DeepRootChildCount));
+            r.SuspectedFailureModes.Add("root_leaf_pollution");
+        }
+        else if (m.DeepRootChildCount > 0)
+        {
+            warns.Add(QualityWarning.Warn("root_child_path_depth_too_high",
+                $"{m.DeepRootChildCount} root children have multi-segment paths — possible orphan placement.",
+                m.DeepRootChildCount));
+        }
+
+        if (m.RawUrlTitleRootChildren > 0)
+        {
+            warns.Add(QualityWarning.Error("raw_url_labels_at_root",
+                $"{m.RawUrlTitleRootChildren} direct root children still have raw URL labels.",
+                m.RawUrlTitleRootChildren));
+            r.SuspectedFailureModes.Add("raw_url_labels_at_root");
+        }
+
+        if (m.SyntheticParentCount > 0)
+        {
+            warns.Add(QualityWarning.Info("synthetic_parents_inserted",
+                $"{m.SyntheticParentCount} synthetic intermediate parent node(s) were inserted to group " +
+                "leaf pages whose URL-prefix parent was never crawled."));
+        }
+
+        // Phase 7: homepage IA quality warnings ───────────────────────────────
+
+        if (m.HomepageAnchoredSections > 0)
+        {
+            warns.Add(QualityWarning.Info("homepage_sections_found",
+                $"{m.HomepageAnchoredSections} homepage card/tile sections detected — " +
+                $"{m.StructuralRootChildren} are anchored at root as structural IA sections."));
+        }
+        else if (m.FlatPageCount > 20)
+        {
+            warns.Add(QualityWarning.Warn("missing_homepage_sections",
+                "No homepage card/tile sections were detected — root hierarchy cannot be anchored " +
+                "to the municipality's intended IA. Check if the homepage is JS-heavy or blocked."));
+            r.SuspectedFailureModes.Add("missing_homepage_sections");
+        }
+
+        if (m.UtilityRootChildren > 5)
+        {
+            warns.Add(QualityWarning.Warn("utility_root_pollution",
+                $"{m.UtilityRootChildren} utility/meta pages (Kontakt, Tillgänglighet, etc.) appear " +
+                "as direct root children — they are grouped in the 'Verktyg & information' viewer section."));
+        }
+
+        if (m.DiscoveredRootChildren > 10)
+        {
+            warns.Add(QualityWarning.Warn("orphan_content_cluster",
+                $"{m.DiscoveredRootChildren} pages at root could not be attached to any structural " +
+                "IA section — they appear as 'Övrigt innehåll' in the viewer.",
+                m.DiscoveredRootChildren));
+            if (m.DeepLeafRootChildren > 10 || m.RootChildCount > 30)
+                r.SuspectedFailureModes.Add("orphan_content_cluster");
+        }
+
         if (m.MaxPagesReached)
         {
             warns.Add(QualityWarning.Warn("max_pages_reached",
@@ -617,6 +757,18 @@ public static class QualityReportBuilder
         sb.AppendLine($"| Max depth reached | {m.MaxDepthReached} |");
         sb.AppendLine($"| Max pages reached | {m.MaxPagesReached} |");
         sb.AppendLine($"| Pages captured | {m.PagesCaptured} |");
+        sb.AppendLine($"| Root children | {m.RootChildCount} |");
+        sb.AppendLine($"| Deep root children (path≥2) | {m.DeepRootChildCount} |");
+        sb.AppendLine($"| Root topology verdict | {m.RootTopologyVerdict} |");
+        sb.AppendLine($"| Synthetic parent nodes | {m.SyntheticParentCount} |");
+        sb.AppendLine($"| Homepage sections detected | {m.HomepageAnchoredSections} |");
+        sb.AppendLine($"| Structural root children | {m.StructuralRootChildren} |");
+        sb.AppendLine($"| Utility root children | {m.UtilityRootChildren} |");
+        sb.AppendLine($"| Raw URL title root children | {m.RawUrlTitleRootChildren} |");
+        sb.AppendLine($"| Synthetic root children | {m.SyntheticRootChildren} |");
+        sb.AppendLine($"| Discovered root children | {m.DiscoveredRootChildren} |");
+        sb.AppendLine($"| Deep-leaf root children | {m.DeepLeafRootChildren} |");
+        sb.AppendLine($"| Singleton root children | {m.SingletonRootChildren} |");
         sb.AppendLine();
 
         if (m.PagesByDepth.Count > 0)
@@ -692,7 +844,40 @@ public static class QualityReportBuilder
         return sb.ToString();
     }
 
+    private static int CountNavPathSegments(string url)
+    {
+        try
+        {
+            return new Uri(url).AbsolutePath
+                .TrimEnd('/')
+                .Split('/', StringSplitOptions.RemoveEmptyEntries)
+                .Length;
+        }
+        catch { return 0; }
+    }
+
     // ── Field extraction helpers ─────────────────────────────────────────────
+
+    private static bool IsRawUrlTitle(string? title, string? url)
+    {
+        var t = (title ?? "").Trim();
+        if (t.Length == 0) return true;
+        if (t.StartsWith("http://", StringComparison.OrdinalIgnoreCase)) return true;
+        if (t.StartsWith("https://", StringComparison.OrdinalIgnoreCase)) return true;
+        if (t.StartsWith("/", StringComparison.Ordinal)) return true;
+        return !string.IsNullOrWhiteSpace(url) && t.Equals(url, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string GetRootTopologyVerdict(QualityMetrics m)
+    {
+        if (m.RootChildCount > 50 || m.DeepRootChildCount > 20 || m.RawUrlTitleRootChildren > 0)
+            return "FAIL";
+
+        if (m.DeepRootChildCount > 0 || m.UtilityRootChildren > 5 || m.DiscoveredRootChildren > 10 || m.SyntheticRootChildren > 8)
+            return "PASS_WITH_MINOR_ISSUES";
+
+        return "PASS";
+    }
 
     private static string? GetField(TelemetryEvent evt, string key)
     {

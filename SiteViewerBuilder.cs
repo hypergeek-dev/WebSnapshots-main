@@ -79,8 +79,82 @@ public sealed class SiteViewerBuilder
         foreach (var vg in nav.VisibleGroups)
             vg.Flat ??= new List<NavItem>();
 
+        foreach (var it in nav.Flat.Take(5000))
+        {
+            var resolved = GetDisplayTitle(it.Title, it.Url);
+            var reason = DisplayTitleResolutionReason(it.Title, it.Url, resolved);
+            _log?.Event(reason == "url_fallback" ? "DISPLAY_TITLE_FALLBACK_USED" : "DISPLAY_TITLE_RESOLVED",
+                ("url", it.Url),
+                ("title", it.Title),
+                ("resolvedTitle", resolved),
+                ("reason", reason));
+        }
+
         var viewerHtml = BuildViewerHtml(host, startUrl, nav, _cfg.DropQueryStrings);
         await File.WriteAllTextAsync(viewerPath, viewerHtml, Encoding.UTF8);
+    }
+
+    // ── Phase 6: Display title helpers ───────────────────────────────────────
+
+    private static string GetDisplayTitle(string? title, string? url)
+    {
+        var t = (title ?? "").Trim();
+        if (t.Length > 0
+            && !t.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
+            && !t.StartsWith("https://", StringComparison.OrdinalIgnoreCase)
+            && !t.StartsWith("/", StringComparison.Ordinal))
+            return t;
+
+        return HumanizeUrlSlug(url ?? "");
+    }
+
+    private static string DisplayTitleResolutionReason(string? title, string? url, string resolved)
+    {
+        var t = (title ?? "").Trim();
+        if (t.Length > 0
+            && !t.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
+            && !t.StartsWith("https://", StringComparison.OrdinalIgnoreCase)
+            && !t.StartsWith("/", StringComparison.Ordinal))
+            return "trusted_non_url_title";
+
+        if (!string.IsNullOrWhiteSpace(resolved)
+            && !resolved.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
+            && !resolved.StartsWith("https://", StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(resolved, url, StringComparison.OrdinalIgnoreCase))
+            return "humanized_slug";
+
+        return "url_fallback";
+    }
+
+    private static string HumanizeUrlSlug(string url)
+    {
+        if (string.IsNullOrWhiteSpace(url)) return url;
+        try
+        {
+            var segments = new Uri(url).AbsolutePath
+                .TrimEnd('/')
+                .Split('/', StringSplitOptions.RemoveEmptyEntries);
+            if (segments.Length == 0) return url;
+            var slug = segments[^1];
+            if (string.IsNullOrWhiteSpace(slug)) return url;
+            var spaced = slug.Replace('-', ' ');
+            spaced = ApplySwedishRepairs(spaced);
+            return spaced.Length > 0
+                ? char.ToUpperInvariant(spaced[0]) + spaced[1..]
+                : url;
+        }
+        catch { return url; }
+    }
+
+    private static string ApplySwedishRepairs(string s)
+    {
+        s = System.Text.RegularExpressions.Regex.Replace(s, @"\bstod\b", "stöd", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        s = System.Text.RegularExpressions.Regex.Replace(s, @"\bgora\b", "göra", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        s = System.Text.RegularExpressions.Regex.Replace(s, @"\bmiljo\b", "miljö", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        s = System.Text.RegularExpressions.Regex.Replace(s, @"\bhallbar\b", "hållbar", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        s = System.Text.RegularExpressions.Regex.Replace(s, @"\bnaring\b", "näring", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        s = System.Text.RegularExpressions.Regex.Replace(s, @"\bomsorg\b", "omsorg", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        return s;
     }
 
     private static string BuildViewerHtml(string host, string startUrl, NavIndex nav, bool dropQueryStrings)
@@ -162,7 +236,7 @@ public sealed class SiteViewerBuilder
         object ToTreeDto(NavNode n)
         {
             var norm = Utils.NormalizeUrl(n.Url, dropQueryStrings);
-            var title = string.IsNullOrWhiteSpace(n.Title) ? n.Url : n.Title;
+            var title = GetDisplayTitle(n.Title, n.Url);
 
             return new
             {
@@ -180,7 +254,7 @@ public sealed class SiteViewerBuilder
             {
                 return new
                 {
-                    title = string.IsNullOrWhiteSpace(seed.Title) ? seed.Url : seed.Title,
+                    title = GetDisplayTitle(seed.Title, seed.Url),
                     url = norm,
                     href = pageMap.TryGetValue(norm, out var href0) ? href0 : "",
                     isExternal = seed.IsExternal,
@@ -189,7 +263,7 @@ public sealed class SiteViewerBuilder
                 };
             }
 
-            var title = string.IsNullOrWhiteSpace(seed.Title) ? seed.Url : seed.Title;
+            var title = GetDisplayTitle(seed.Title, seed.Url);
             var children = new List<object>();
 
             if (childrenByParent.TryGetValue(norm, out var kids))
@@ -305,6 +379,47 @@ public sealed class SiteViewerBuilder
         var treeJson = JsonSerializer.Serialize(treeDtos);
         var visibleJson = JsonSerializer.Serialize(visibleDtos);
 
+        // Phase 2+4+5+8: build URL classification sets for viewer section grouping.
+        var homepageSections = nav.HomepageSections ?? new List<HomepageSection>();
+
+        var utilityUrlsLower = flat
+            .Where(x => x.IsUtility && !string.IsNullOrWhiteSpace(x.Url))
+            .Select(x => Utils.NormalizeUrl(x.Url, dropQueryStrings).ToLowerInvariant())
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        // Structural = root children whose URL matches a homepage section.
+        var homepageSectionUrlsLower = homepageSections
+            .Where(hs => !string.IsNullOrWhiteSpace(hs.Url))
+            .Select(hs => Utils.NormalizeUrl(hs.Url, dropQueryStrings).ToLowerInvariant())
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        // Discovered = root children that are neither structural nor utility.
+        var allRootChildUrlsLower = flat
+            .Where(x => !string.IsNullOrWhiteSpace(x.Url)
+                     && !string.IsNullOrWhiteSpace(x.ParentUrl)
+                     && x.ParentUrl.Equals(startAbs, StringComparison.OrdinalIgnoreCase)
+                     && !x.Url.Equals(startAbs, StringComparison.OrdinalIgnoreCase))
+            .Select(x => Utils.NormalizeUrl(x.Url, dropQueryStrings).ToLowerInvariant())
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var discoveredUrlsLower = allRootChildUrlsLower
+            .Where(u => !homepageSectionUrlsLower.Contains(u) && !utilityUrlsLower.Contains(u))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        // Homepage sections ordered by DOM position for Phase 2 viewer ordering.
+        var homepageSectionsJs = homepageSections
+            .OrderBy(hs => hs.DomOrder)
+            .Select(hs => new
+            {
+                url = Utils.NormalizeUrl(hs.Url, dropQueryStrings).ToLowerInvariant(),
+                title = hs.Title
+            })
+            .ToList();
+
+        var utilityUrlsJson      = JsonSerializer.Serialize(utilityUrlsLower.ToArray());
+        var discoveredUrlsJson   = JsonSerializer.Serialize(discoveredUrlsLower.ToArray());
+        var homepageSectionsJson = JsonSerializer.Serialize(homepageSectionsJs);
+
         var sb = new StringBuilder();
 
         sb.AppendLine("<!doctype html>");
@@ -314,7 +429,7 @@ public sealed class SiteViewerBuilder
         sb.AppendLine("  <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">");
         sb.Append("  <title>").Append(E(host)).AppendLine("</title>");
         sb.AppendLine("  <style>");
-        sb.AppendLine("    :root { --bg:#1f1f24; --bg2:#2a2a33; --bg3:#333340; --fg:#fff; --muted:rgba(255,255,255,.7); --accent:#7a003c; --border:rgba(255,255,255,.12); }");
+        sb.AppendLine("    :root { --bg:#1f1f24; --bg2:#2a2a33; --bg3:#333340; --fg:#fff; --muted:rgba(255,255,255,.7); --accent:#7a003c; --border:rgba(255,255,255,.12); --util:#1c2030; --disc:#1a1f1a; }");
         sb.AppendLine("    html,body{height:100%;}");
         sb.AppendLine("    body{margin:0;overflow:hidden;font-family:system-ui,Segoe UI,Arial,sans-serif;background:#111;color:var(--fg);}");
         sb.AppendLine("    .layout{display:flex;height:100vh;width:100vw;}");
@@ -334,12 +449,25 @@ public sealed class SiteViewerBuilder
         sb.AppendLine("    .search input{width:100%;padding:9px 10px;border-radius:10px;border:1px solid var(--border);background:rgba(0,0,0,.2);color:var(--fg);outline:none;box-sizing:border-box;}");
         sb.AppendLine("    .search input::placeholder{color:rgba(255,255,255,.55);}");
         sb.AppendLine("    .treeTools{padding:8px 14px;border-bottom:1px solid var(--border);display:flex;gap:8px;flex-wrap:wrap;}");
-        sb.AppendLine("    nav{flex:1;overflow:auto;padding:8px 8px 16px 8px;}");
-        sb.AppendLine("    .muted{color:var(--muted);font-size:.82rem;padding:8px 6px;}");
-        sb.AppendLine("    .sectionTitle{padding:10px 8px 6px 8px;color:var(--muted);font-size:.78rem;font-weight:700;text-transform:uppercase;letter-spacing:.04em;}");
-        sb.AppendLine("    .tree{font-size:.88rem;line-height:1.3;}");
+        sb.AppendLine("    nav{flex:1;overflow:auto;padding:0 0 16px 0;}");
+        sb.AppendLine("    .muted{color:var(--muted);font-size:.82rem;padding:8px 12px;}");
+        // Site header (municipality root node)
+        sb.AppendLine("    .siteHeader{padding:8px 12px 6px;border-bottom:1px solid var(--border);}");
+        sb.AppendLine("    .siteHeader .tree-link,.siteHeader .site-name{font-weight:700;font-size:.9rem;color:var(--fg);}");
+        // Main section header (plain label — Navigation)
+        sb.AppendLine("    .sectionTitle{padding:8px 12px 4px;color:var(--muted);font-size:.75rem;font-weight:700;text-transform:uppercase;letter-spacing:.05em;}");
+        // Collapsible section toggles (Utility / Discovered)
+        sb.AppendLine("    .sectionToggle{width:100%;text-align:left;padding:6px 12px;background:transparent;border:none;border-top:1px solid var(--border);color:var(--muted);font-size:.75rem;font-weight:700;text-transform:uppercase;letter-spacing:.05em;cursor:pointer;display:flex;align-items:center;gap:6px;font-family:inherit;}");
+        sb.AppendLine("    .sectionToggle:hover{background:var(--bg2);color:var(--fg);}");
+        sb.AppendLine("    .sectionArrow{font-size:.85rem;opacity:.7;flex:0 0 auto;}");
+        sb.AppendLine("    .sectionCount{opacity:.55;font-weight:400;text-transform:none;letter-spacing:0;margin-left:auto;}");
+        sb.AppendLine("    .sectionBody--hidden{display:none;}");
+        sb.AppendLine("    .sectionBody--util{background:rgba(0,30,80,.15);}");
+        sb.AppendLine("    .sectionBody--disc{background:rgba(0,40,0,.1);}");
+        // Tree styles
+        sb.AppendLine("    .tree{font-size:.88rem;line-height:1.3;padding:0 4px;}");
         sb.AppendLine("    .tree ul{list-style:none;margin:0;padding-left:18px;}");
-        sb.AppendLine("    .tree-root{padding-left:0 !important;}");
+        sb.AppendLine("    .tree-root{padding-left:4px !important;}");
         sb.AppendLine("    .tree-item{margin:1px 0;}");
         sb.AppendLine("    .tree-row{display:flex;align-items:center;gap:4px;min-height:24px;}");
         sb.AppendLine("    .toggle{width:18px;height:18px;display:inline-flex;align-items:center;justify-content:center;border:1px solid var(--border);border-radius:3px;background:var(--bg2);color:#fff;font-size:12px;cursor:pointer;user-select:none;flex:0 0 18px;}");
@@ -397,6 +525,9 @@ public sealed class SiteViewerBuilder
         sb.AppendLine("    (function(){");
         sb.Append("      const treeData = ").Append(treeJson).AppendLine(";");
         sb.Append("      const visibleGroups = ").Append(visibleJson).AppendLine(";");
+        sb.Append("      const utilityUrls = new Set(").Append(utilityUrlsJson).AppendLine(");");
+        sb.Append("      const discoveredUrls = new Set(").Append(discoveredUrlsJson).AppendLine(");");
+        sb.Append("      const homepageSections = ").Append(homepageSectionsJson).AppendLine(";");
         sb.AppendLine("      const navPane = document.getElementById('navPane');");
         sb.AppendLine("      const iframe = document.getElementById('view');");
         sb.AppendLine("      const q = document.getElementById('q');");
@@ -405,6 +536,7 @@ public sealed class SiteViewerBuilder
         sb.AppendLine("      const btnOpenStart = document.getElementById('openStart');");
 
         sb.AppendLine("      function norm(s){ return (s || '').trim().toLowerCase(); }");
+        sb.AppendLine("      function normUrl(u){ return (u || '').toLowerCase().replace(/\\/$/, ''); }");
         sb.AppendLine("      function escapeHtml(s){");
         sb.AppendLine("        return (s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\\\"/g,'&quot;').replace(/'/g,'&#39;');");
         sb.AppendLine("      }");
@@ -477,17 +609,91 @@ public sealed class SiteViewerBuilder
         sb.AppendLine("      }");
 
         sb.AppendLine("      function renderTree(filter){");
-        sb.AppendLine("        const parts = treeData.map(n => buildTreeNode(n, 0, filter, 'tree-link')).filter(x => x.visible).map(x => x.html);");
-        sb.AppendLine("        const visibleParts = visibleGroups.map(g => buildVisibleGroup(g, filter)).filter(Boolean);");
+        sb.AppendLine("        const f = norm(filter);");
         sb.AppendLine("        let html = '';");
 
-        sb.AppendLine("        html += '<div class=\"sectionTitle\">Navigation</div>';");
-        sb.AppendLine("        if (parts.length) {");
-        sb.AppendLine("          html += '<div class=\"tree\"><ul class=\"tree-root\">' + parts.join('') + '</ul></div>';");
+        // Build homepage section order map for Phase 2 root topology priority
+        sb.AppendLine("        const hsOrder = {};");
+        sb.AppendLine("        homepageSections.forEach((s, i) => { hsOrder[normUrl(s.url)] = i; });");
+
+        // Root node (municipality)
+        sb.AppendLine("        if (treeData.length > 0) {");
+        sb.AppendLine("          const rootNode = treeData[0];");
+        sb.AppendLine("          const rootHref = rootNode.href || '';");
+        sb.AppendLine("          const rootTitle = rootNode.title || rootNode.url || '';");
+        sb.AppendLine("          html += '<div class=\"siteHeader\">';");
+        sb.AppendLine("          if (rootHref) {");
+        sb.AppendLine("            html += '<a class=\"tree-link\" target=\"view\" href=\"' + escapeHtml(rootHref) + '\" data-href=\"' + escapeHtml(rootHref) + '\">' + escapeHtml(rootTitle) + '</a>';");
+        sb.AppendLine("          } else {");
+        sb.AppendLine("            html += '<span class=\"site-name\">' + escapeHtml(rootTitle) + '</span>';");
+        sb.AppendLine("          }");
+        sb.AppendLine("          html += '</div>';");
+
+        // Classify root children into structural / utility / discovered
+        sb.AppendLine("          const rootKids = Array.isArray(rootNode.children) ? rootNode.children : [];");
+        sb.AppendLine("          const structural = [], utility = [], discovered = [];");
+        sb.AppendLine("          for (const kid of rootKids) {");
+        sb.AppendLine("            const ku = normUrl(kid.url || '');");
+        sb.AppendLine("            if (utilityUrls.has(ku)) utility.push(kid);");
+        sb.AppendLine("            else if (discoveredUrls.has(ku)) discovered.push(kid);");
+        sb.AppendLine("            else structural.push(kid);");
+        sb.AppendLine("          }");
+
+        // Sort structural by homepage section order (Phase 2)
+        sb.AppendLine("          structural.sort((a, b) => {");
+        sb.AppendLine("            const ai = hsOrder[normUrl(a.url)] !== undefined ? hsOrder[normUrl(a.url)] : 9999;");
+        sb.AppendLine("            const bi = hsOrder[normUrl(b.url)] !== undefined ? hsOrder[normUrl(b.url)] : 9999;");
+        sb.AppendLine("            return ai - bi;");
+        sb.AppendLine("          });");
+
+        // Main Navigation section
+        sb.AppendLine("          const sParts = structural.map(n => buildTreeNode(n, 0, filter, 'tree-link')).filter(x => x.visible);");
+        sb.AppendLine("          if (sParts.length || !f) {");
+        sb.AppendLine("            html += '<div class=\"sectionTitle\">Navigation</div>';");
+        sb.AppendLine("            if (sParts.length)");
+        sb.AppendLine("              html += '<div class=\"tree\"><ul class=\"tree-root\">' + sParts.map(x => x.html).join('') + '</ul></div>';");
+        sb.AppendLine("            else");
+        sb.AppendLine("              html += '<div class=\"muted\">Inga matchande sidor.</div>';");
+        sb.AppendLine("          }");
+
+        // Utility / meta section (Phase 8 — collapsed by default unless searching)
+        sb.AppendLine("          const uParts = utility.map(n => buildTreeNode(n, 0, filter, 'tree-link')).filter(x => x.visible);");
+        sb.AppendLine("          if (uParts.length) {");
+        sb.AppendLine("            const uOpen = !!f;");
+        sb.AppendLine("            html += '<button class=\"sectionToggle\" data-target=\"utilBody\" type=\"button\">';");
+        sb.AppendLine("            html += '<span class=\"sectionArrow\">' + (uOpen ? '\\u25BE' : '\\u25B8') + '</span>';");
+        sb.AppendLine("            html += ' Verktyg &amp; information';");
+        sb.AppendLine("            html += '<span class=\"sectionCount\">(' + utility.length + ')</span>';");
+        sb.AppendLine("            html += '</button>';");
+        sb.AppendLine("            html += '<div id=\"utilBody\" class=\"sectionBody sectionBody--util' + (uOpen ? '' : ' sectionBody--hidden') + '\">';");
+        sb.AppendLine("            html += '<div class=\"tree\"><ul class=\"tree-root\">' + uParts.map(x => x.html).join('') + '</ul></div>';");
+        sb.AppendLine("            html += '</div>';");
+        sb.AppendLine("          }");
+
+        // Discovered content section (Phase 8 — collapsed by default unless searching)
+        sb.AppendLine("          const dParts = discovered.map(n => buildTreeNode(n, 0, filter, 'tree-link')).filter(x => x.visible);");
+        sb.AppendLine("          if (dParts.length) {");
+        sb.AppendLine("            const dOpen = !!f;");
+        sb.AppendLine("            html += '<button class=\"sectionToggle\" data-target=\"discBody\" type=\"button\">';");
+        sb.AppendLine("            html += '<span class=\"sectionArrow\">' + (dOpen ? '\\u25BE' : '\\u25B8') + '</span>';");
+        sb.AppendLine("            html += ' \\u00D6vrigt inneh\\u00E5ll';");
+        sb.AppendLine("            html += '<span class=\"sectionCount\">(' + discovered.length + ')</span>';");
+        sb.AppendLine("            html += '</button>';");
+        sb.AppendLine("            html += '<div id=\"discBody\" class=\"sectionBody sectionBody--disc' + (dOpen ? '' : ' sectionBody--hidden') + '\">';");
+        sb.AppendLine("            html += '<div class=\"tree\"><ul class=\"tree-root\">' + dParts.map(x => x.html).join('') + '</ul></div>';");
+        sb.AppendLine("            html += '</div>';");
+        sb.AppendLine("          }");
+
         sb.AppendLine("        } else {");
-        sb.AppendLine("          html += '<div class=\"muted\">No matching tree nodes.</div>';");
+        // No root node — fall back to rendering all treeData nodes flat
+        sb.AppendLine("          const parts = treeData.map(n => buildTreeNode(n, 0, filter, 'tree-link')).filter(x => x.visible);");
+        sb.AppendLine("          html += '<div class=\"sectionTitle\">Navigation</div>';");
+        sb.AppendLine("          if (parts.length) html += '<div class=\"tree\"><ul class=\"tree-root\">' + parts.map(x => x.html).join('') + '</ul></div>';");
+        sb.AppendLine("          else html += '<div class=\"muted\">No matching tree nodes.</div>';");
         sb.AppendLine("        }");
 
+        // Visible groups (existing)
+        sb.AppendLine("        const visibleParts = visibleGroups.map(g => buildVisibleGroup(g, filter)).filter(Boolean);");
         sb.AppendLine("        if (visibleParts.length) {");
         sb.AppendLine("          html += '<div class=\"sectionTitle\">Visible on start page</div>';");
         sb.AppendLine("          html += visibleParts.join('');");
@@ -495,6 +701,20 @@ public sealed class SiteViewerBuilder
 
         sb.AppendLine("        navPane.innerHTML = html;");
 
+        // Section toggle listeners (utility / discovered)
+        sb.AppendLine("        navPane.querySelectorAll('.sectionToggle').forEach(btn => {");
+        sb.AppendLine("          btn.addEventListener('click', function(){");
+        sb.AppendLine("            const targetId = this.getAttribute('data-target');");
+        sb.AppendLine("            const body = document.getElementById(targetId);");
+        sb.AppendLine("            if (!body) return;");
+        sb.AppendLine("            const isHidden = body.classList.contains('sectionBody--hidden');");
+        sb.AppendLine("            body.classList.toggle('sectionBody--hidden', !isHidden);");
+        sb.AppendLine("            const arrow = this.querySelector('.sectionArrow');");
+        sb.AppendLine("            if (arrow) arrow.textContent = isHidden ? '\\u25BE' : '\\u25B8';");
+        sb.AppendLine("          });");
+        sb.AppendLine("        });");
+
+        // Tree node toggle listeners (existing)
         sb.AppendLine("        navPane.querySelectorAll('.toggle').forEach(btn => {");
         sb.AppendLine("          if (btn.classList.contains('empty')) return;");
         sb.AppendLine("          btn.addEventListener('click', function(e){");
@@ -505,7 +725,7 @@ public sealed class SiteViewerBuilder
         sb.AppendLine("            const children = li.querySelector(':scope > ul.children');");
         sb.AppendLine("            if (!children) return;");
         sb.AppendLine("            const hidden = children.classList.toggle('hidden');");
-        sb.AppendLine("            btn.textContent = hidden ? '+' : '−';");
+        sb.AppendLine("            btn.textContent = hidden ? '+' : '\\u2212';");
         sb.AppendLine("          });");
         sb.AppendLine("        });");
         sb.AppendLine("      }");
@@ -513,8 +733,10 @@ public sealed class SiteViewerBuilder
         sb.AppendLine("      function expandCollapseAll(expand){");
         sb.AppendLine("        navPane.querySelectorAll('ul.children').forEach(el => el.classList.toggle('hidden', !expand));");
         sb.AppendLine("        navPane.querySelectorAll('.toggle').forEach(el => {");
-        sb.AppendLine("          if (!el.classList.contains('empty')) el.textContent = expand ? '−' : '+';");
+        sb.AppendLine("          if (!el.classList.contains('empty')) el.textContent = expand ? '\\u2212' : '+';");
         sb.AppendLine("        });");
+        sb.AppendLine("        navPane.querySelectorAll('.sectionBody').forEach(el => el.classList.toggle('sectionBody--hidden', !expand));");
+        sb.AppendLine("        navPane.querySelectorAll('.sectionArrow').forEach(el => { el.textContent = expand ? '\\u25BE' : '\\u25B8'; });");
         sb.AppendLine("      }");
 
         sb.AppendLine("      function refresh(){");

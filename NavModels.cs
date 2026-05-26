@@ -22,6 +22,12 @@ public sealed class NavIndex
 
     // Start-page visible but not necessarily structural modules.
     public List<VisibleLinkGroup> VisibleGroups { get; set; } = new();
+
+    // Municipality-authored top-level IA sections detected from homepage card/tile clusters.
+    // These represent the intended root taxonomy of the site (e.g. "Omsorg och stöd",
+    // "Förskola, skola och utbildning") and are used to anchor the viewer hierarchy.
+    [System.Text.Json.Serialization.JsonPropertyName("homepageSections")]
+    public List<HomepageSection> HomepageSections { get; set; } = new();
 }
 
 public sealed class NavGroup
@@ -40,6 +46,42 @@ public sealed class VisibleLinkGroup
     public string Role { get; set; } = "";
     public int Order { get; set; }
     public List<NavItem> Flat { get; set; } = new();
+}
+
+// A municipality-authored top-level IA anchor detected from homepage card/tile clusters.
+public sealed class HomepageSection
+{
+    [System.Text.Json.Serialization.JsonPropertyName("url")]
+    public string Url { get; set; } = "";
+
+    [System.Text.Json.Serialization.JsonPropertyName("title")]
+    public string Title { get; set; } = "";
+
+    // Position in the DOM on the homepage (preserves intended IA order).
+    [System.Text.Json.Serialization.JsonPropertyName("domOrder")]
+    public int DomOrder { get; set; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("confidence")]
+    public double Confidence { get; set; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("positiveEvidence")]
+    public List<string> PositiveEvidence { get; set; } = new();
+
+    [System.Text.Json.Serialization.JsonPropertyName("negativeEvidence")]
+    public List<string> NegativeEvidence { get; set; } = new();
+}
+
+public sealed class NavigationDecisionEvidence
+{
+    public string DecisionType { get; set; } = "";
+    public string CandidateUrl { get; set; } = "";
+    public string CandidateTitle { get; set; } = "";
+    public bool Accepted { get; set; }
+    public double Confidence { get; set; }
+    public double Threshold { get; set; }
+    public List<string> PositiveEvidence { get; set; } = new();
+    public List<string> NegativeEvidence { get; set; } = new();
+    public string FinalReason { get; set; } = "";
 }
 
 public sealed class NavItem
@@ -63,6 +105,22 @@ public sealed class NavItem
     [System.Text.Json.Serialization.JsonIgnore(
         Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingDefault)]
     public bool IsDisplayOnly { get; set; } = false;
+
+    // True when this node was not crawled but was synthesised from URL-path topology
+    // to fill a missing intermediate parent (e.g. /fritidsaktiviteter was never fetched
+    // but its children were discovered and would otherwise fall to root).
+    // Omitted from JSON when false to keep nav.json compact.
+    [System.Text.Json.Serialization.JsonIgnore(
+        Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingDefault)]
+    public bool IsSynthetic { get; set; } = false;
+
+    // True when this page matches utility/meta heuristics (Kontakt, Tillgänglighet,
+    // Intranät, Press, etc.) and should be visually grouped separately from the
+    // municipality's primary IA sections in the viewer.
+    // Omitted from JSON when false to keep nav.json compact.
+    [System.Text.Json.Serialization.JsonIgnore(
+        Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingDefault)]
+    public bool IsUtility { get; set; } = false;
 }
 
 public sealed class NavNode
