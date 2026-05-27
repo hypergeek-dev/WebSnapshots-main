@@ -15,10 +15,10 @@ public sealed class SiteViewerBuilder
         _log = log;
     }
 
-    public async Task BuildAsync(string siteDir, string host, string startUrl)
+    public async Task BuildAsync(string siteDir, string host, string startUrl, string outputFileName = "index.htm")
     {
         var navPath = Path.Combine(siteDir, "nav.json");
-        var viewerPath = Path.Combine(siteDir, "index.htm");
+        var viewerPath = Path.Combine(siteDir, outputFileName);
 
         NavIndex nav = new NavIndex
         {
@@ -90,7 +90,11 @@ public sealed class SiteViewerBuilder
                 ("reason", reason));
         }
 
-        var viewerHtml = BuildViewerHtml(host, startUrl, nav, _cfg.DropQueryStrings);
+        var shotsDir = Path.Combine(siteDir, "shots");
+        var hasScreenshots = Directory.Exists(shotsDir)
+            && Directory.EnumerateFiles(shotsDir, "*.webp", SearchOption.TopDirectoryOnly).Any();
+
+        var viewerHtml = BuildViewerHtml(host, startUrl, nav, _cfg.DropQueryStrings, hasScreenshots);
         await File.WriteAllTextAsync(viewerPath, viewerHtml, Encoding.UTF8);
     }
 
@@ -157,7 +161,7 @@ public sealed class SiteViewerBuilder
         return s;
     }
 
-    private static string BuildViewerHtml(string host, string startUrl, NavIndex nav, bool dropQueryStrings)
+    private static string BuildViewerHtml(string host, string startUrl, NavIndex nav, bool dropQueryStrings, bool hasScreenshots = true)
     {
         static string E(string s) => System.Net.WebUtility.HtmlEncode(s ?? "");
 
@@ -484,8 +488,9 @@ public sealed class SiteViewerBuilder
         sb.AppendLine("    .badge-ext{font-size:.68rem;vertical-align:middle;background:rgba(255,180,0,.18);color:#ffb400;border-radius:3px;padding:0 3px;margin-left:4px;white-space:nowrap;}");
         sb.AppendLine("    .badge-js{font-size:.68rem;vertical-align:middle;background:rgba(100,180,255,.15);color:#64b4ff;border-radius:3px;padding:0 3px;margin-left:4px;white-space:nowrap;}");
         sb.AppendLine("    .js-note{font-size:.75rem;color:rgba(255,255,255,.4);padding:2px 8px 4px 8px;font-style:italic;}");
-        sb.AppendLine("    main{flex:1;background:#f5f5f5;}");
-        sb.AppendLine("    iframe{width:100%;height:100%;border:0;background:#f5f5f5;}");
+        sb.AppendLine("    main{flex:1;background:#f5f5f5;display:flex;flex-direction:column;}");
+        sb.AppendLine("    iframe{flex:1;width:100%;border:0;background:#f5f5f5;min-height:0;}");
+        sb.AppendLine("    .text-only-banner{background:#5c3100;color:#ffd06f;padding:8px 14px;font-size:.84rem;flex:0 0 auto;border-bottom:1px solid rgba(0,0,0,.25);}");
         sb.AppendLine("  </style>");
         sb.AppendLine("</head>");
         sb.AppendLine("<body>");
@@ -517,6 +522,8 @@ public sealed class SiteViewerBuilder
         sb.AppendLine("      <nav id=\"navPane\"></nav>");
         sb.AppendLine("    </aside>");
         sb.AppendLine("    <main>");
+        if (!hasScreenshots)
+            sb.AppendLine("      <div class=\"text-only-banner\">&#9888; Text-only mode &mdash; no screenshots captured. Navigation structure is complete; click a page to view extracted text.</div>");
         sb.Append("      <iframe id=\"view\" name=\"view\" src=\"").Append(E(initialSrc ?? "about:blank")).AppendLine("\"></iframe>");
         sb.AppendLine("    </main>");
         sb.AppendLine("  </div>");

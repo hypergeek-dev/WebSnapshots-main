@@ -10,6 +10,8 @@
 *.userosscache
 *.sln.docstates
 .claude/
+CLAUDE.md
+claude*.md
 *.env
 
 # User-specific files (MonoDevelop/Xamarin Studio)
@@ -116,6 +118,19 @@ StyleCopReport.xml
 
 # WebSnapshots generated diagnostic/crawl outputs
 diagnostics*/
+/output*/
+/overnight_batch*/
+/overnight_batch_sitevision*/
+/archive_inventory/
+
+# WebSnapshots generated analysis and audit notes
+/cleanup-plan.md
+/cms-baselines.md
+/diagnostics-evolution.md
+/engineering-history.md
+/milestone-runs.md
+/operational-audit.md
+/regression-history.md
 
 # Chutzpah Test files
 _Chutzpah*

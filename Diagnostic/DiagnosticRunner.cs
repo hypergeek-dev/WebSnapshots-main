@@ -59,6 +59,25 @@ public sealed class DiagnosticRunner
         var host = new Uri(target.Url).Host;
         var municipality = Utils.HostToMunicipality(host);
 
+        // Written first so the folder is labelled before any crash or cancellation.
+        await File.WriteAllTextAsync(
+            Path.Combine(siteDir, "DIAGNOSTIC_ONLY.txt"),
+            string.Join(Environment.NewLine,
+                "DIAGNOSTIC RUN — NOT A PRODUCTION ARCHIVE",
+                "==========================================",
+                "",
+                "This folder was created by the WebSnapshots diagnostic pipeline.",
+                "It is NOT an archive-grade production scrape.",
+                "",
+                $"Target:    {target.Id} — {target.Name}",
+                $"Profile:   {profile.Name}",
+                $"Snapshots: {(profile.CaptureSnapshots ? "YES" : "NO (text-only mode)")}",
+                $"Run ID:    {runId}",
+                "",
+                $"Production scrapes live under output/{municipality}/[date]/.",
+                ""),
+            System.Text.Encoding.UTF8);
+
         Console.WriteLine($"[DIAGNOSTIC] Output: {siteDir}");
         Console.WriteLine();
 

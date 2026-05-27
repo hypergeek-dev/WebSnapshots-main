@@ -212,7 +212,7 @@ public static class AppRunner
             using (siteLog.Scope("BUILD_VIEWER", ("host", host)))
             {
                 var viewer = new SiteViewerBuilder(cfg, siteLog);
-                await viewer.BuildAsync(siteDir, host, startUrl);
+                await viewer.BuildAsync(siteDir, host, startUrl, "viewer.htm");
             }
 
             // 4) Entry index.html for this scrape root
@@ -299,7 +299,7 @@ public static class AppRunner
         try
         {
             var viewer = new SiteViewerBuilder(cfg, siteLog);
-            await viewer.BuildAsync(siteDir, host, startUrl);
+            await viewer.BuildAsync(siteDir, host, startUrl, "viewer.htm");
         }
         catch { }
     }

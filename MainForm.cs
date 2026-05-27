@@ -183,7 +183,7 @@ public sealed class MainForm : Form
         var rowOut = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = false };
         rowOut.Controls.Add(new Label { Text = "Output folder:", AutoSize = true, Padding = new Padding(0, 6, 0, 0) });
         _out.Width = 360;
-        _out.Text = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), "WebSnapshotsOutput");
+        _out.Text = Path.Combine(Directory.GetCurrentDirectory(), "output");
         _browse.Text = "Browse…";
         rowOut.Controls.Add(_out);
         rowOut.Controls.Add(_browse);
@@ -246,13 +246,7 @@ public sealed class MainForm : Form
         _remove.Click += (_, __) => RemoveSelected();
         _clear.Click += (_, __) => _list.Items.Clear();
 
-        _browse.Click += (_, __) =>
-        {
-            using var dlg = new FolderBrowserDialog();
-            dlg.SelectedPath = _out.Text;
-            if (dlg.ShowDialog(this) == DialogResult.OK)
-                _out.Text = dlg.SelectedPath;
-        };
+        _browse.Click += (_, __) => BrowseForOutputFolder();
 
         // Mutual exclusivity: landing-only vs quick preview
         _landingOnly.CheckedChanged += (_, __) =>
@@ -367,6 +361,231 @@ public sealed class MainForm : Form
         var sel = _list.SelectedItems.Cast<object>().ToList();
         foreach (var it in sel)
             _list.Items.Remove(it);
+    }
+
+    private void BrowseForOutputFolder()
+    {
+        try
+        {
+            var selected = ShowLocalFolderPicker(GetExistingFolderForDialog(_out.Text));
+            if (!string.IsNullOrWhiteSpace(selected))
+                _out.Text = selected;
+        }
+        catch (Exception ex)
+        {
+            UiLog("[ERROR] Could not open folder browser: " + ex.Message);
+            MessageBox.Show(
+                this,
+                "Could not open the folder browser.\n\n" + ex.Message,
+                "WebSnapshots",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+        }
+    }
+
+    private string? ShowLocalFolderPicker(string initialPath)
+    {
+        using var form = new Form
+        {
+            Text = "Select output folder",
+            StartPosition = FormStartPosition.CenterParent,
+            Width = 720,
+            Height = 520,
+            MinimizeBox = false,
+            MaximizeBox = false,
+            ShowInTaskbar = false
+        };
+
+        var root = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 4,
+            Padding = new Padding(12)
+        };
+        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        form.Controls.Add(root);
+
+        var pathBox = new TextBox { Dock = DockStyle.Fill, Text = initialPath };
+        root.Controls.Add(pathBox);
+
+        var navRow = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = false };
+        var driveBox = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 140 };
+        var upButton = new Button { Text = "Up", Width = 70 };
+        var refreshButton = new Button { Text = "Refresh", Width = 80 };
+        var newFolderButton = new Button { Text = "New folder", Width = 100 };
+        navRow.Controls.Add(driveBox);
+        navRow.Controls.Add(upButton);
+        navRow.Controls.Add(refreshButton);
+        navRow.Controls.Add(newFolderButton);
+        root.Controls.Add(navRow);
+
+        var folderList = new ListBox { Dock = DockStyle.Fill, IntegralHeight = false };
+        root.Controls.Add(folderList);
+
+        var buttonRow = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            AutoSize = true,
+            FlowDirection = FlowDirection.RightToLeft,
+            WrapContents = false
+        };
+        var selectButton = new Button { Text = "Select", Width = 90, DialogResult = DialogResult.OK };
+        var cancelButton = new Button { Text = "Cancel", Width = 90, DialogResult = DialogResult.Cancel };
+        buttonRow.Controls.Add(selectButton);
+        buttonRow.Controls.Add(cancelButton);
+        root.Controls.Add(buttonRow);
+
+        form.AcceptButton = selectButton;
+        form.CancelButton = cancelButton;
+
+        string currentPath = initialPath;
+
+        void LoadDrives()
+        {
+            driveBox.Items.Clear();
+            foreach (var drive in DriveInfo.GetDrives().Where(d => d.IsReady))
+                driveBox.Items.Add(drive.RootDirectory.FullName);
+
+            var currentRoot = Path.GetPathRoot(currentPath);
+            if (!string.IsNullOrWhiteSpace(currentRoot) && driveBox.Items.Contains(currentRoot))
+                driveBox.SelectedItem = currentRoot;
+            else if (driveBox.Items.Count > 0)
+                driveBox.SelectedIndex = 0;
+        }
+
+        void LoadFolder(string path)
+        {
+            try
+            {
+                path = Path.GetFullPath(Environment.ExpandEnvironmentVariables(path.Trim()));
+                Directory.CreateDirectory(path);
+
+                currentPath = path;
+                pathBox.Text = currentPath;
+                folderList.Items.Clear();
+
+                foreach (var dir in Directory.EnumerateDirectories(currentPath).OrderBy(d => d, StringComparer.OrdinalIgnoreCase))
+                    folderList.Items.Add(Path.GetFileName(dir));
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(form, ex.Message, "Cannot open folder", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
+
+        LoadDrives();
+        LoadFolder(currentPath);
+
+        driveBox.SelectedIndexChanged += (_, __) =>
+        {
+            if (driveBox.SelectedItem is string drive)
+                LoadFolder(drive);
+        };
+
+        pathBox.KeyDown += (_, e) =>
+        {
+            if (e.KeyCode == Keys.Enter)
+            {
+                e.SuppressKeyPress = true;
+                LoadFolder(pathBox.Text);
+            }
+        };
+
+        folderList.DoubleClick += (_, __) =>
+        {
+            if (folderList.SelectedItem is string name)
+                LoadFolder(Path.Combine(currentPath, name));
+        };
+
+        upButton.Click += (_, __) =>
+        {
+            var parent = Directory.GetParent(currentPath);
+            if (parent != null)
+                LoadFolder(parent.FullName);
+        };
+
+        refreshButton.Click += (_, __) => LoadFolder(pathBox.Text);
+
+        newFolderButton.Click += (_, __) =>
+        {
+            var baseName = "New folder";
+            var candidate = Path.Combine(currentPath, baseName);
+            var index = 2;
+            while (Directory.Exists(candidate))
+                candidate = Path.Combine(currentPath, $"{baseName} {index++}");
+
+            Directory.CreateDirectory(candidate);
+            LoadFolder(candidate);
+        };
+
+        selectButton.Click += (_, __) => LoadFolder(pathBox.Text);
+
+        return form.ShowDialog(this) == DialogResult.OK ? currentPath : null;
+    }
+
+    private static string GetExistingFolderForDialog(string? path)
+    {
+        try
+        {
+            var current = string.IsNullOrWhiteSpace(path)
+                ? Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory)
+                : Environment.ExpandEnvironmentVariables(path.Trim());
+
+            if (!Path.IsPathRooted(current))
+                current = Path.GetFullPath(Path.Combine(Directory.GetCurrentDirectory(), current));
+
+            if (Directory.Exists(current) && !IsCloudBackedPath(current))
+                return current;
+
+            var parent = Directory.GetParent(current);
+            while (parent != null)
+            {
+                if (Directory.Exists(parent.FullName) && !IsCloudBackedPath(parent.FullName))
+                    return parent.FullName;
+
+                parent = parent.Parent;
+            }
+        }
+        catch
+        {
+        }
+
+        var localOutput = Path.Combine(Directory.GetCurrentDirectory(), "output");
+        return Directory.Exists(localOutput) ? localOutput : Directory.GetCurrentDirectory();
+    }
+
+    private static bool IsCloudBackedPath(string path)
+    {
+        try
+        {
+            var fullPath = Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            var oneDrive = Environment.GetEnvironmentVariable("OneDrive");
+            var oneDriveCommercial = Environment.GetEnvironmentVariable("OneDriveCommercial");
+            var oneDriveConsumer = Environment.GetEnvironmentVariable("OneDriveConsumer");
+
+            return IsSameOrChild(fullPath, oneDrive)
+                || IsSameOrChild(fullPath, oneDriveCommercial)
+                || IsSameOrChild(fullPath, oneDriveConsumer);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool IsSameOrChild(string path, string? root)
+    {
+        if (string.IsNullOrWhiteSpace(root))
+            return false;
+
+        var normalizedRoot = Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        return path.Equals(normalizedRoot, StringComparison.OrdinalIgnoreCase)
+            || path.StartsWith(normalizedRoot + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
+            || path.StartsWith(normalizedRoot + Path.AltDirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
     }
 
     private async Task RunAsync()
