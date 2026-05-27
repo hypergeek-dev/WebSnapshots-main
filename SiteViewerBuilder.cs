@@ -562,7 +562,7 @@ public sealed class SiteViewerBuilder
         sb.AppendLine("        if (!visible) return { visible:false, html:'' };");
 
         sb.AppendLine("        const hasChildren = kids.length > 0;");
-        sb.AppendLine("        const expandedByDefault = f ? true : (level < 1);");
+        sb.AppendLine("        const expandedByDefault = !!f;");
         sb.AppendLine("        const toggleText = expandedByDefault ? '−' : '+';");
         sb.AppendLine("        const childClass = expandedByDefault ? 'children' : 'children hidden';");
         sb.AppendLine("        const toggleClass = hasChildren ? 'toggle' : 'toggle empty';");
@@ -692,11 +692,18 @@ public sealed class SiteViewerBuilder
         sb.AppendLine("          else html += '<div class=\"muted\">No matching tree nodes.</div>';");
         sb.AppendLine("        }");
 
-        // Visible groups (existing)
+        // Visible groups: collapsed by default unless searching, same as utility/discovered.
         sb.AppendLine("        const visibleParts = visibleGroups.map(g => buildVisibleGroup(g, filter)).filter(Boolean);");
         sb.AppendLine("        if (visibleParts.length) {");
-        sb.AppendLine("          html += '<div class=\"sectionTitle\">Visible on start page</div>';");
+        sb.AppendLine("          const vOpen = !!f;");
+        sb.AppendLine("          html += '<button class=\"sectionToggle\" data-target=\"visibleBody\" type=\"button\">';");
+        sb.AppendLine("          html += '<span class=\"sectionArrow\">' + (vOpen ? '\\u25BE' : '\\u25B8') + '</span>';");
+        sb.AppendLine("          html += ' Visible on start page';");
+        sb.AppendLine("          html += '<span class=\"sectionCount\">(' + visibleGroups.length + ')</span>';");
+        sb.AppendLine("          html += '</button>';");
+        sb.AppendLine("          html += '<div id=\"visibleBody\" class=\"sectionBody' + (vOpen ? '' : ' sectionBody--hidden') + '\">';");
         sb.AppendLine("          html += visibleParts.join('');");
+        sb.AppendLine("          html += '</div>';");
         sb.AppendLine("        }");
 
         sb.AppendLine("        navPane.innerHTML = html;");

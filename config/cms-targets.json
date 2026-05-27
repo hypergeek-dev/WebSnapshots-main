@@ -1,6 +1,13 @@
 {
   "targets": [
     {
+      "id": "sitevision_lund",
+      "name": "Lunds kommun",
+      "cms": "SiteVision",
+      "url": "https://www.lund.se/",
+      "purpose": "Lund homepage module / Hitta snabbt regression target"
+    },
+    {
       "id": "sitevision_ystad",
       "name": "Ystad kommun",
       "cms": "SiteVision",

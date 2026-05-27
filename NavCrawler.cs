@@ -46,6 +46,14 @@ public sealed class NavCrawler
 
     private sealed record QItem(string Url, int Depth, string ParentUrl, bool StructuralBranch, string Text = "");
 
+    private sealed class RootCandidateClassification
+    {
+        public List<HomepageSection> Accepted { get; } = new();
+        public HashSet<string> AcceptedUrls { get; } = new(StringComparer.OrdinalIgnoreCase);
+        public HashSet<string> RejectedUrls { get; } = new(StringComparer.OrdinalIgnoreCase);
+        public int CandidateCount { get; set; }
+    }
+
     public NavCrawler(SnapshotConfig cfg, PlaywrightRunner pw, Logger log, TelemetryWriter? telemetry = null)
     {
         _cfg = cfg ?? throw new ArgumentNullException(nameof(cfg));
@@ -105,7 +113,8 @@ public sealed class NavCrawler
 
         var navGroups = new List<NavGroup>();
         var visibleGroups = new List<VisibleLinkGroup>();
-        var homepageSections = new List<HomepageSection>();
+        var rootClassification = new RootCandidateClassification();
+        var homepageSections = rootClassification.Accepted;
         CmsDetectionResult cms = new() { Kind = CmsKind.Unknown, Confidence = "low" };
         CmsAwareNavExtractor? cmsExtractor = null;
 
@@ -151,8 +160,9 @@ public sealed class NavCrawler
 
             // Phase 1: extract municipality-authored homepage card/tile sections.
             // These are the canonical IA anchors used for viewer hierarchy and reparenting.
-            homepageSections = await ExtractHomepageSectionsAsync(
+            rootClassification = await ExtractHomepageSectionsAsync(
                 page, startAbs, host, opt.DropQueryStrings, _log);
+            homepageSections = rootClassification.Accepted;
         }
         catch (Exception ex)
         {
@@ -373,6 +383,34 @@ public sealed class NavCrawler
                     ("host", host),
                     ("promoted", promoted.Count),
                     ("rejected", rejected.Count));
+            }
+        }
+
+        if (rootClassification.AcceptedUrls.Count > 0)
+        {
+            var acceptedRootPromoted = 0;
+            foreach (var u in rootClassification.AcceptedUrls)
+            {
+                if (string.IsNullOrWhiteSpace(u)) continue;
+                if (u.Equals(startAbs, StringComparison.OrdinalIgnoreCase)) continue;
+                if (primaryNavSet.Add(u))
+                {
+                    primaryNavUrls.Add(u);
+                    acceptedRootPromoted++;
+                }
+            }
+
+            if (acceptedRootPromoted > 0)
+            {
+                _log.Event("ACCEPTED_ROOT_CANDIDATES_PROMOTED",
+                    ("host", host),
+                    ("count", acceptedRootPromoted));
+
+                _telemetry?.Emit(TelemetryPhase.NavStartExtraction, "accepted_root_candidates_promoted",
+                    TelemetrySeverity.Info, startAbs, new Dictionary<string, object?>
+                    {
+                        ["count"] = acceptedRootPromoted
+                    });
             }
         }
 
@@ -823,11 +861,18 @@ public sealed class NavCrawler
 
         allFlat = FinalizeFlatNavigation(allFlat, startAbs, _log);
         treeFlat = FinalizeTreeFlat(treeFlat, allFlat, _log);
+        var visibleTreeFlat = BuildVisibleTreeFlat(
+            treeFlat,
+            allFlat,
+            startAbs,
+            rootClassification,
+            _log,
+            _telemetry);
 
         // Phase 4: tag utility/meta pages for viewer grouping.
         TagUtilityPages(allFlat, _log);
 
-        var nodes = NavTreeBuilder.Build(allFlat, startAbs);
+        var nodes = NavTreeBuilder.Build(visibleTreeFlat, startAbs);
 
         foreach (var g in navGroups)
             g.Nodes = NavTreeBuilder.Build(g.Flat, startAbs);
@@ -2073,6 +2118,187 @@ public sealed class NavCrawler
         return synced.Count > 0 ? synced : correctedFlat;
     }
 
+    private static List<NavItem> BuildVisibleTreeFlat(
+        List<NavItem> treeFlat,
+        List<NavItem> allFlat,
+        string startUrl,
+        RootCandidateClassification rootClassification,
+        Logger? log,
+        TelemetryWriter? telemetry)
+    {
+        if (treeFlat.Count == 0)
+            return allFlat;
+
+        var acceptedRootKeys = rootClassification.AcceptedUrls
+            .Select(CanonicalUrlKey)
+            .Where(k => !string.IsNullOrWhiteSpace(k))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var rejectedRootKeys = rootClassification.RejectedUrls
+            .Select(CanonicalUrlKey)
+            .Where(k => !string.IsNullOrWhiteSpace(k))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var canonicalStart = CanonicalUrlKey(startUrl);
+        var hasRootClassification = rootClassification.CandidateCount > 0 && acceptedRootKeys.Count > 0;
+
+        var visibleRootChildrenBefore = treeFlat
+            .Count(x => !CanonicalUrlKey(x.Url).Equals(canonicalStart, StringComparison.OrdinalIgnoreCase)
+                     && CanonicalUrlKey(x.ParentUrl).Equals(canonicalStart, StringComparison.OrdinalIgnoreCase));
+
+        if (!hasRootClassification)
+        {
+            EmitVisibleRootTelemetry(
+                telemetry,
+                startUrl,
+                rootClassification.AcceptedUrls.Count,
+                rootClassification.RejectedUrls.Count,
+                visibleRootChildrenBefore,
+                visibleRootChildrenBefore,
+                0,
+                CountAllFlatRootChildrenNotInTree(allFlat, treeFlat, startUrl),
+                0);
+            return treeFlat;
+        }
+
+        var suppressedRootKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var item in treeFlat)
+        {
+            var itemKey = CanonicalUrlKey(item.Url);
+            if (itemKey.Equals(canonicalStart, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            if (!CanonicalUrlKey(item.ParentUrl).Equals(canonicalStart, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            if (!acceptedRootKeys.Contains(itemKey))
+                suppressedRootKeys.Add(itemKey);
+        }
+
+        var orphanedChildrenAfterSuppression = 0;
+        var visibleByKey = new Dictionary<string, NavItem>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var item in treeFlat)
+        {
+            var itemKey = CanonicalUrlKey(item.Url);
+            if (string.IsNullOrWhiteSpace(itemKey))
+                continue;
+
+            if (itemKey.Equals(canonicalStart, StringComparison.OrdinalIgnoreCase))
+            {
+                visibleByKey[itemKey] = CloneWithCanonicalUrls(item);
+                continue;
+            }
+
+            if (suppressedRootKeys.Contains(itemKey))
+                continue;
+
+            var clone = CloneWithCanonicalUrls(item);
+            var parentKey = CanonicalUrlKey(clone.ParentUrl);
+            if (!visibleByKey.ContainsKey(parentKey))
+            {
+                var reassignedParent = FindAcceptedAncestorUrl(clone.Url, rootClassification.AcceptedUrls, startUrl);
+                if (string.IsNullOrWhiteSpace(reassignedParent))
+                {
+                    orphanedChildrenAfterSuppression++;
+                    continue;
+                }
+
+                clone.ParentUrl = reassignedParent;
+            }
+
+            visibleByKey[itemKey] = clone;
+        }
+
+        var visible = visibleByKey.Values.ToList();
+
+        var visibleRootChildrenAfter = visible
+            .Count(x => !CanonicalUrlKey(x.Url).Equals(canonicalStart, StringComparison.OrdinalIgnoreCase)
+                     && CanonicalUrlKey(x.ParentUrl).Equals(canonicalStart, StringComparison.OrdinalIgnoreCase));
+
+        var rejectedSuppressed = suppressedRootKeys.Count(k => rejectedRootKeys.Contains(k));
+        var crawlableButNotVisibleRoot = CountAllFlatRootChildrenNotInTree(allFlat, visible, startUrl);
+
+        log?.Event("VISIBLE_ROOT_CLASSIFICATION_APPLIED",
+            ("rootCandidatesAccepted", rootClassification.AcceptedUrls.Count),
+            ("rootCandidatesRejected", rootClassification.RejectedUrls.Count),
+            ("visibleRootChildrenBefore", visibleRootChildrenBefore),
+            ("visibleRootChildrenAfter", visibleRootChildrenAfter),
+            ("rejectedCandidatesSuppressedFromVisibleRoot", rejectedSuppressed),
+            ("crawlableButNotVisibleRoot", crawlableButNotVisibleRoot),
+            ("orphanedChildrenAfterSuppression", orphanedChildrenAfterSuppression));
+
+        EmitVisibleRootTelemetry(
+            telemetry,
+            startUrl,
+            rootClassification.AcceptedUrls.Count,
+            rootClassification.RejectedUrls.Count,
+            visibleRootChildrenBefore,
+            visibleRootChildrenAfter,
+            rejectedSuppressed,
+            crawlableButNotVisibleRoot,
+            orphanedChildrenAfterSuppression);
+
+        return visible;
+    }
+
+    private static void EmitVisibleRootTelemetry(
+        TelemetryWriter? telemetry,
+        string startUrl,
+        int rootCandidatesAccepted,
+        int rootCandidatesRejected,
+        int visibleRootChildrenBefore,
+        int visibleRootChildrenAfter,
+        int rejectedCandidatesSuppressedFromVisibleRoot,
+        int crawlableButNotVisibleRoot,
+        int orphanedChildrenAfterSuppression)
+    {
+        telemetry?.Emit(TelemetryPhase.TreeBuilding, "visible_root_classification_applied", TelemetrySeverity.Info,
+            startUrl, new Dictionary<string, object?>
+            {
+                ["rootCandidatesAccepted"] = rootCandidatesAccepted,
+                ["rootCandidatesRejected"] = rootCandidatesRejected,
+                ["visibleRootChildrenBefore"] = visibleRootChildrenBefore,
+                ["visibleRootChildrenAfter"] = visibleRootChildrenAfter,
+                ["rejectedCandidatesSuppressedFromVisibleRoot"] = rejectedCandidatesSuppressedFromVisibleRoot,
+                ["crawlableButNotVisibleRoot"] = crawlableButNotVisibleRoot,
+                ["orphanedChildrenAfterSuppression"] = orphanedChildrenAfterSuppression
+            });
+    }
+
+    private static int CountAllFlatRootChildrenNotInTree(List<NavItem> allFlat, List<NavItem> treeFlat, string startUrl)
+    {
+        var treeRootKeys = treeFlat
+            .Where(x => CanonicalUrlKey(x.ParentUrl).Equals(CanonicalUrlKey(startUrl), StringComparison.OrdinalIgnoreCase))
+            .Select(x => CanonicalUrlKey(x.Url))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        return allFlat
+            .Where(x => !CanonicalUrlKey(x.Url).Equals(CanonicalUrlKey(startUrl), StringComparison.OrdinalIgnoreCase)
+                     && CanonicalUrlKey(x.ParentUrl).Equals(CanonicalUrlKey(startUrl), StringComparison.OrdinalIgnoreCase))
+            .Select(x => CanonicalUrlKey(x.Url))
+            .Where(k => !treeRootKeys.Contains(k))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Count();
+    }
+
+    private static string? FindAcceptedAncestorUrl(string url, HashSet<string> acceptedRootUrls, string startUrl)
+    {
+        foreach (var accepted in acceptedRootUrls)
+        {
+            if (accepted.Equals(url, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            if (accepted.Equals(startUrl, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            if (IsUrlDescendantOf(accepted, url))
+                return accepted;
+        }
+
+        return null;
+    }
+
     private static NavItem ChooseBetterNavItem(NavItem a, NavItem b, string canonicalStart)
     {
         var scoreA = NavItemScore(a, canonicalStart);
@@ -2435,7 +2661,7 @@ public sealed class NavCrawler
     // under the same parent DOM element in the main content area (not in
     // header/footer/nav).  These clusters represent the site's intended root
     // taxonomy (e.g. "Omsorg och stöd", "Förskola, skola och utbildning").
-    private async Task<List<HomepageSection>> ExtractHomepageSectionsAsync(
+    private async Task<RootCandidateClassification> ExtractHomepageSectionsAsync(
         IPage page,
         string startUrl,
         string host,
@@ -2514,12 +2740,13 @@ public sealed class NavCrawler
                 return candidates.sort((a, b) => a.domOrder - b.domOrder);
             }", host);
 
+            var classification = new RootCandidateClassification();
             if (raw == null || raw.Length == 0)
-                return new List<HomepageSection>();
+                return classification;
 
-            var sections = new List<HomepageSection>();
             var accepted = 0;
             var rejected = 0;
+            classification.CandidateCount = raw.Length;
             foreach (var r in raw)
             {
                 var url = NormalizeInternalUrl(r.url, startUrl, host, dropQueryStrings);
@@ -2534,12 +2761,14 @@ public sealed class NavCrawler
                 if (!decision.Accepted)
                 {
                     rejected++;
+                    classification.RejectedUrls.Add(url);
                     EmitDecision(log, _telemetry, TelemetryPhase.NavStartExtraction, "HOMEPAGE_ANCHOR_REJECTED", decision);
                     continue;
                 }
 
                 accepted++;
-                sections.Add(new HomepageSection
+                classification.AcceptedUrls.Add(url);
+                classification.Accepted.Add(new HomepageSection
                 {
                     Url = url,
                     Title = (r.title ?? "").Trim(),
@@ -2553,8 +2782,8 @@ public sealed class NavCrawler
 
             log?.Event("HOMEPAGE_SECTIONS_EXTRACTED",
                 ("host", host),
-                ("count", sections.Count),
-                ("sample", string.Join(", ", sections.Take(5).Select(s => $"'{s.Title}'"))));
+                ("count", classification.Accepted.Count),
+                ("sample", string.Join(", ", classification.Accepted.Take(5).Select(s => $"'{s.Title}'"))));
 
             log?.Event("HOMEPAGE_ANCHOR_GROUP_SUMMARY",
                 ("host", host),
@@ -2572,12 +2801,12 @@ public sealed class NavCrawler
                     ["threshold"] = 0.68
                 });
 
-            return sections;
+            return classification;
         }
         catch (Exception ex)
         {
             log?.Warn($"HOMEPAGE_SECTIONS_WARN host={host} err={ex.Message}");
-            return new List<HomepageSection>();
+            return new RootCandidateClassification();
         }
     }
 

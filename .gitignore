@@ -422,3 +422,6 @@ FodyWeavers.xsd
 *.msp
 
 /output_manual_test
+/output/
+/overnight_batch/
+/Analysis/
