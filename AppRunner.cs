@@ -328,7 +328,7 @@ a:hover{{text-decoration:underline}}
 .code{{font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; font-size:.9rem}}
 </style>
 
-<div class=""sub""><a href=""../index.html"">← {E(municipality)} index</a> | <a href=""../../index.html"">Run index</a></div>
+<div class=""sub""><a href=""../index.htm"">← {E(municipality)} index</a> | <a href=""../../index.htm"">Run index</a></div>
 <h1>{E(municipality)} <small class=""sub"">({E(host)})</small></h1>
 <div class=""sub""><span class=""badge"">{E(status)}</span> <span class=""sub"">pages:{pagesDone}</span></div>
 <div class=""sub"">Start URL: <span class=""code"">{E(startUrl)}</span></div>

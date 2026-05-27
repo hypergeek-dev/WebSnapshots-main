@@ -224,6 +224,18 @@ public static class Program
             await indexBuilder.BuildAsync(runDir, runId, results.ToList());
         }
 
+        using (log.Scope("BUILD_MUNICIPALITY_INDEXES"))
+        {
+            var muniBuilder = new MunicipalityIndexBuilder(log);
+            var muniFolders = results
+                .Select(r => r.DisplayName)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            foreach (var muni in muniFolders)
+                await muniBuilder.BuildAsync(cfg.OutputDir, muni);
+        }
+
         var manifest = new RunManifest
         {
             RunId = runId,
@@ -327,10 +339,33 @@ public static class Program
             using (siteLog.Scope("BUILD_VIEWER", ("host", host)))
             {
                 var viewer = new SiteViewerBuilder(cfg, siteLog);
-                await viewer.BuildAsync(siteDir, host, startUrl);
+                await viewer.BuildAsync(siteDir, host, startUrl, "viewer.htm");
             }
 
-            results.Add((host, municipality, $"{municipality}/{scrapeFolderName}/index.htm", "OK", pagesDone));
+            // Entry page (both extensions for compatibility)
+            var viewerRel = "viewer.htm";
+            var entryHtml = BuildScrapeEntryHtml(municipality, host, startUrl, status, pagesDone, viewerRel);
+            await File.WriteAllTextAsync(Path.Combine(scrapeRootDir, "index.html"), entryHtml, Encoding.UTF8);
+            await File.WriteAllTextAsync(Path.Combine(scrapeRootDir, "index.htm"), entryHtml, Encoding.UTF8);
+
+            // Scrape metadata
+            var scrapeMeta = new
+            {
+                Municipality = municipality,
+                Host = host,
+                StartUrl = startUrl,
+                Status = status,
+                PagesDone = pagesDone,
+                GeneratedLocal = DateTimeOffset.Now,
+                EntryRel = $"{municipality}/{scrapeFolderName}/index.html",
+                ViewerRel = $"{municipality}/{scrapeFolderName}/viewer.htm"
+            };
+            await File.WriteAllTextAsync(
+                Path.Combine(scrapeRootDir, "scrape.json"),
+                JsonSerializer.Serialize(scrapeMeta, new JsonSerializerOptions { WriteIndented = true }),
+                Encoding.UTF8);
+
+            results.Add((host, municipality, $"{municipality}/{scrapeFolderName}/index.html", "OK", pagesDone));
         }
         catch (OperationCanceledException)
         {
@@ -386,6 +421,41 @@ public static class Program
             await viewer.BuildAsync(siteDir, host, startUrl);
         }
         catch { }
+    }
+
+    private static string BuildScrapeEntryHtml(string municipality, string host, string startUrl, string status, int pagesDone, string viewerRel)
+    {
+        static string E(string s) => System.Net.WebUtility.HtmlEncode(s ?? "");
+        var viewerLink = viewerRel.Contains('#') ? viewerRel : viewerRel + "#start";
+        return $@"<!doctype html>
+<html lang=""sv"">
+<meta charset=""utf-8"">
+<title>{E(municipality)} - {E(host)}</title>
+<meta name=""viewport"" content=""width=device-width,initial-scale=1"">
+<style>
+:root {{ --fg:#222; --muted:#666; --accent:#7a003c; --chip:#eef; --border:#ddd; }}
+body{{font-family:system-ui,Segoe UI,Arial,sans-serif;margin:2rem;color:var(--fg);max-width:1100px}}
+h1{{margin:0 0 .25rem 0;font-size:1.8rem}}
+.sub{{color:var(--muted);font-size:.95rem;margin:.15rem 0}}
+.badge{{background:var(--chip);color:#334;padding:.1rem .4rem;border-radius:.4rem;font-size:.75rem;margin-left:.5rem}}
+a{{color:var(--accent);text-decoration:none}}
+a:hover{{text-decoration:underline}}
+.card{{border:1px solid var(--border);border-radius:12px;padding:1rem;margin-top:1rem}}
+.code{{font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; font-size:.9rem}}
+</style>
+
+<div class=""sub""><a href=""../index.htm"">← {E(municipality)} index</a> | <a href=""../../index.htm"">Run index</a></div>
+<h1>{E(municipality)} <small class=""sub"">({E(host)})</small></h1>
+<div class=""sub""><span class=""badge"">{E(status)}</span> <span class=""sub"">pages:{pagesDone}</span></div>
+<div class=""sub"">Start URL: <span class=""code"">{E(startUrl)}</span></div>
+
+<div class=""card"">
+  <h2 style=""margin-top:0"">Open scrape</h2>
+  <p><a href=""{E(viewerLink)}"">Open viewer</a></p>
+  <p class=""sub"">This folder is self-contained. To replace a bad scrape, replace this date folder.</p>
+  <p class=""sub"">Metadata: <span class=""code"">scrape.json</span></p>
+</div>
+</html>";
     }
 
     private static string ResolveSitesPath(string sitesPathWork, string sitesPathBin)

@@ -77,7 +77,7 @@ public sealed class MunicipalityIndexBuilder
         var sb = new StringBuilder();
         foreach (var m in metas)
         {
-            var entry = E(m.EntryRel);
+            var entry = E($"{m.ScrapeFolder}/index.html");
             var status = E(m.Status);
             var host = E(m.Host);
             var pages = m.PagesDone;
@@ -110,7 +110,7 @@ a:hover{{text-decoration:underline}}
 .code{{font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; font-size:.9rem}}
 </style>
 <header>
-  <div class=""sub""><a href=""../index.html"">← Run index</a></div>
+  <div class=""sub""><a href=""../index.htm"">← Run index</a></div>
   <h1>{E(municipalityFolderName)}</h1>
   <div class=""sub"">Scrapes: {metas.Count}</div>
   <div class=""sub"">JSON: <span class=""code"">index.json</span></div>
