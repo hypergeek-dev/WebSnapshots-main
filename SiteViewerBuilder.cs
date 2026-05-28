@@ -391,23 +391,25 @@ public sealed class SiteViewerBuilder
             .Select(x => Utils.NormalizeUrl(x.Url, dropQueryStrings).ToLowerInvariant())
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
-        // Structural = root children whose URL matches a homepage section.
+        // Homepage sections are positive ordering evidence, not the structural
+        // allow-list. Primary/root nav children stay structural unless they are
+        // explicitly marked as utility/noise.
         var homepageSectionUrlsLower = homepageSections
             .Where(hs => !string.IsNullOrWhiteSpace(hs.Url))
             .Select(hs => Utils.NormalizeUrl(hs.Url, dropQueryStrings).ToLowerInvariant())
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
-        // Discovered = root children that are neither structural nor utility.
-        var allRootChildUrlsLower = flat
+        // Discovered/root helper buckets are reserved for explicit synthetic
+        // roots such as "Ovrigt". Do not demote legitimate primary nav roots
+        // merely because homepage card extraction accepted few or no anchors.
+        var discoveredUrlsLower = flat
             .Where(x => !string.IsNullOrWhiteSpace(x.Url)
                      && !string.IsNullOrWhiteSpace(x.ParentUrl)
                      && x.ParentUrl.Equals(startAbs, StringComparison.OrdinalIgnoreCase)
-                     && !x.Url.Equals(startAbs, StringComparison.OrdinalIgnoreCase))
+                     && !x.Url.Equals(startAbs, StringComparison.OrdinalIgnoreCase)
+                     && x.IsSynthetic
+                     && !x.IsUtility)
             .Select(x => Utils.NormalizeUrl(x.Url, dropQueryStrings).ToLowerInvariant())
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
-
-        var discoveredUrlsLower = allRootChildUrlsLower
-            .Where(u => !homepageSectionUrlsLower.Contains(u) && !utilityUrlsLower.Contains(u))
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
         // Homepage sections ordered by DOM position for Phase 2 viewer ordering.

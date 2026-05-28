@@ -13,4 +13,10 @@
 		<PackageReference Include="SixLabors.ImageSharp" Version="3.1.12" />
 	</ItemGroup>
 
+	<ItemGroup>
+		<Compile Remove="_audit_tool\**\*.cs" />
+		<EmbeddedResource Remove="_audit_tool\**\*" />
+		<None Remove="_audit_tool\**\*" />
+	</ItemGroup>
+
 </Project>

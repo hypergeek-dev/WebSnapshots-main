@@ -12,11 +12,6 @@ public sealed class MainForm : Form
     private readonly NumericUpDown _depth = new();
     private readonly TextBox _out = new();
     private readonly Button _browse = new();
-    private readonly CheckBox _landingOnly = new();
-    private readonly CheckBox _quickPreview = new();
-    private readonly NumericUpDown _previewPagesPerDepth = new();
-    private readonly NumericUpDown _previewChildrenPerPage = new();
-    private readonly NumericUpDown _previewSeconds = new();
 
     private readonly Button _run = new();
     private readonly Button _pause = new();
@@ -114,19 +109,16 @@ public sealed class MainForm : Form
         {
             Dock = DockStyle.Fill,
             ColumnCount = 1,
-            RowCount = 9
+            RowCount = 7
         };
 
         right.RowStyles.Add(new RowStyle(SizeType.AutoSize));        // Settings title
         right.RowStyles.Add(new RowStyle(SizeType.AutoSize));        // Depth
-        right.RowStyles.Add(new RowStyle(SizeType.AutoSize));        // Landing only checkbox
-        right.RowStyles.Add(new RowStyle(SizeType.AutoSize));        // Quick preview
         right.RowStyles.Add(new RowStyle(SizeType.AutoSize));        // Output
         right.RowStyles.Add(new RowStyle(SizeType.AutoSize));        // Note
         right.RowStyles.Add(new RowStyle(SizeType.AutoSize));        // Log label row
         right.RowStyles.Add(new RowStyle(SizeType.Percent, 100));    // Log (expands)
         right.RowStyles.Add(new RowStyle(SizeType.AutoSize));        // Buttons row
-        right.RowStyles.Add(new RowStyle(SizeType.AutoSize));        // (spare)
 
         root.Controls.Add(right, 1, 0);
 
@@ -141,44 +133,6 @@ public sealed class MainForm : Form
         _depth.Width = 80;
         rowDepth.Controls.Add(_depth);
         right.Controls.Add(rowDepth);
-
-        // Landing page only checkbox
-        var rowLanding = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = false };
-        _landingOnly.Text = "Landing page only";
-        _landingOnly.AutoSize = true;
-        _landingOnly.Padding = new Padding(0, 4, 0, 4);
-        rowLanding.Controls.Add(_landingOnly);
-        right.Controls.Add(rowLanding);
-
-        // Quick preview mode (fast tree test)
-        var rowPreview = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = true };
-        _quickPreview.Text = "Quick preview";
-        _quickPreview.AutoSize = true;
-        _quickPreview.Padding = new Padding(0, 4, 8, 4);
-        rowPreview.Controls.Add(_quickPreview);
-
-        rowPreview.Controls.Add(new Label { Text = "Pages/depth:", AutoSize = true, Padding = new Padding(0, 8, 0, 0) });
-        _previewPagesPerDepth.Minimum = 1;
-        _previewPagesPerDepth.Maximum = 500;
-        _previewPagesPerDepth.Value = 25;
-        _previewPagesPerDepth.Width = 70;
-        rowPreview.Controls.Add(_previewPagesPerDepth);
-
-        rowPreview.Controls.Add(new Label { Text = "Children/page:", AutoSize = true, Padding = new Padding(0, 8, 0, 0) });
-        _previewChildrenPerPage.Minimum = 1;
-        _previewChildrenPerPage.Maximum = 500;
-        _previewChildrenPerPage.Value = 18;
-        _previewChildrenPerPage.Width = 70;
-        rowPreview.Controls.Add(_previewChildrenPerPage);
-
-        rowPreview.Controls.Add(new Label { Text = "Seconds:", AutoSize = true, Padding = new Padding(0, 8, 0, 0) });
-        _previewSeconds.Minimum = 10;
-        _previewSeconds.Maximum = 3600;
-        _previewSeconds.Value = 90;
-        _previewSeconds.Width = 70;
-        rowPreview.Controls.Add(_previewSeconds);
-
-        right.Controls.Add(rowPreview);
 
         var rowOut = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = false };
         rowOut.Controls.Add(new Label { Text = "Output folder:", AutoSize = true, Padding = new Padding(0, 6, 0, 0) });
@@ -248,49 +202,12 @@ public sealed class MainForm : Form
 
         _browse.Click += (_, __) => BrowseForOutputFolder();
 
-        // Mutual exclusivity: landing-only vs quick preview
-        _landingOnly.CheckedChanged += (_, __) =>
-        {
-            if (_landingOnly.Checked)
-                _quickPreview.Checked = false;
-        };
-
-        _quickPreview.CheckedChanged += (_, __) =>
-        {
-            if (_quickPreview.Checked)
-                _landingOnly.Checked = false;
-
-            _previewPagesPerDepth.Enabled = _quickPreview.Checked;
-            _previewChildrenPerPage.Enabled = _quickPreview.Checked;
-            _previewSeconds.Enabled = _quickPreview.Checked;
-        };
-
-        // Init enabled state
-        _previewPagesPerDepth.Enabled = false;
-        _previewChildrenPerPage.Enabled = false;
-        _previewSeconds.Enabled = false;
-
         _clearLog.Click += (_, __) =>
         {
             _log.Clear();
             _followTail = true;
 
             while (_logQueue.TryDequeue(out var ignored)) { }
-        };
-
-        // Landing only checkbox interaction with depth
-        _landingOnly.CheckedChanged += (_, __) =>
-        {
-            if (_landingOnly.Checked)
-            {
-                _depth.Enabled = false;
-                _depth.Value = 0;
-            }
-            else
-            {
-                _depth.Enabled = true;
-                if (_depth.Value == 0) _depth.Value = 3;
-            }
         };
 
         // Convenience: Ctrl+Enter in paste box = Add
@@ -603,11 +520,6 @@ public sealed class MainForm : Form
             MaxDepth = (int)_depth.Value,
             OutputBaseDir = _out.Text,
             UseDatedOutput = true,
-            LandingOnly = _landingOnly.Checked,
-            QuickPreview = _quickPreview.Checked,
-            PreviewMaxPagesPerDepth = (int)_previewPagesPerDepth.Value,
-            PreviewMaxChildrenPerPage = (int)_previewChildrenPerPage.Value,
-            PreviewMaxTotalSeconds = (int)_previewSeconds.Value
         };
         cfg.Validate();
 
@@ -622,12 +534,6 @@ public sealed class MainForm : Form
 
         _log.Clear();
         UiLog("[RUN] Starting…");
-
-        if (cfg.LandingOnly)
-            UiLog("[MODE] Landing page only - will capture 1 page per site");
-
-        if (cfg.QuickPreview)
-            UiLog($"[MODE] Quick preview - depth={cfg.MaxDepth} pages/depth={cfg.PreviewMaxPagesPerDepth} children/page={cfg.PreviewMaxChildrenPerPage} cap={cfg.PreviewMaxTotalSeconds}s");
 
         try
         {
@@ -739,8 +645,7 @@ public sealed class MainForm : Form
         _addPaste.Enabled = !running;
         _remove.Enabled = !running;
         _clear.Enabled = !running;
-        _landingOnly.Enabled = !running;
-        _depth.Enabled = !running && !_landingOnly.Checked;
+        _depth.Enabled = !running;
 
         _pause.Text = "Pause";
     }

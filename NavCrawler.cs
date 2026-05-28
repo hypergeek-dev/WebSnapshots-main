@@ -235,6 +235,7 @@ public sealed class NavCrawler
 
         var primaryNavUrls = new List<string>();
         var primaryNavSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var protectedPrimaryRootCandidates = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         if (navGroups.Count > 0)
         {
@@ -275,6 +276,9 @@ public sealed class NavCrawler
                 {
                     continue;
                 }
+
+                if (IsProtectedPrimaryRootCandidate(u, it.Title, startAbs))
+                    protectedPrimaryRootCandidates.Add(u);
 
                 if (primaryNavSet.Add(u))
                     primaryNavUrls.Add(u);
@@ -363,8 +367,11 @@ public sealed class NavCrawler
             if (promoted.Count > 0)
             {
                 foreach (var u in promoted)
+                {
+                    protectedPrimaryRootCandidates.Add(u);
                     if (primaryNavSet.Add(u))
                         primaryNavUrls.Add(u);
+                }
 
                 var reason = $"primary nav had zero usable links; promoted {promoted.Count} visible municipal section links";
 
@@ -386,9 +393,22 @@ public sealed class NavCrawler
             }
         }
 
+        // Snapshot the real primary/header roots before homepage anchors are
+        // added as crawl supplements. Homepage cards must not gain the same
+        // protection as primary navigation roots.
+        var protectedPrimaryRootSet = protectedPrimaryRootCandidates
+            .Select(CanonicalUrlKey)
+            .Where(k => !string.IsNullOrWhiteSpace(k))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        _log.Event("NAV_PRIMARY_ROOT_PROTECTION",
+            ("protectedRootCount", protectedPrimaryRootSet.Count),
+            ("primaryCount", primaryNavUrls.Count));
+
         if (rootClassification.AcceptedUrls.Count > 0)
         {
             var acceptedRootPromoted = 0;
+
             foreach (var u in rootClassification.AcceptedUrls)
             {
                 if (string.IsNullOrWhiteSpace(u)) continue;
@@ -410,7 +430,7 @@ public sealed class NavCrawler
                     TelemetrySeverity.Info, startAbs, new Dictionary<string, object?>
                     {
                         ["count"] = acceptedRootPromoted
-                    });
+                });
             }
         }
 
@@ -866,6 +886,7 @@ public sealed class NavCrawler
             allFlat,
             startAbs,
             rootClassification,
+            protectedPrimaryRootSet,
             _log,
             _telemetry);
 
@@ -2123,6 +2144,7 @@ public sealed class NavCrawler
         List<NavItem> allFlat,
         string startUrl,
         RootCandidateClassification rootClassification,
+        HashSet<string> protectedPrimaryRootKeys,
         Logger? log,
         TelemetryWriter? telemetry)
     {
@@ -2142,12 +2164,49 @@ public sealed class NavCrawler
         var canonicalStart = CanonicalUrlKey(startUrl);
         var hasRootClassification = rootClassification.CandidateCount > 0 && acceptedRootKeys.Count > 0;
 
-        var visibleRootChildrenBefore = treeFlat
-            .Count(x => !CanonicalUrlKey(x.Url).Equals(canonicalStart, StringComparison.OrdinalIgnoreCase)
-                     && CanonicalUrlKey(x.ParentUrl).Equals(canonicalStart, StringComparison.OrdinalIgnoreCase));
+        var visibleRootChildKeysBefore = treeFlat
+            .Where(x => !CanonicalUrlKey(x.Url).Equals(canonicalStart, StringComparison.OrdinalIgnoreCase)
+                     && CanonicalUrlKey(x.ParentUrl).Equals(canonicalStart, StringComparison.OrdinalIgnoreCase))
+            .Select(x => CanonicalUrlKey(x.Url))
+            .Where(k => !string.IsNullOrWhiteSpace(k))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var visibleRootChildrenBefore = visibleRootChildKeysBefore.Count;
+        var acceptedPrimaryRootOverlap = acceptedRootKeys.Count(k => visibleRootChildKeysBefore.Contains(k));
+
+        void LogSuppressionSkipped(string reason, int orphanedChildren = 0, int visibleRootChildrenAfter = -1)
+        {
+            var after = visibleRootChildrenAfter < 0 ? visibleRootChildrenBefore : visibleRootChildrenAfter;
+            log?.Event("VISIBLE_ROOT_CLASSIFICATION_SKIPPED",
+                ("reason", reason),
+                ("rootCandidatesAccepted", rootClassification.AcceptedUrls.Count),
+                ("rootCandidatesRejected", rootClassification.RejectedUrls.Count),
+                ("acceptedPrimaryRootOverlap", acceptedPrimaryRootOverlap),
+                ("visibleRootChildrenBefore", visibleRootChildrenBefore),
+                ("visibleRootChildrenAfter", after),
+                ("orphanedChildrenAfterSuppression", orphanedChildren),
+                ("crawlableButNotVisibleRoot", CountAllFlatRootChildrenNotInTree(allFlat, treeFlat, startUrl)));
+
+            EmitVisibleRootGuardrailTelemetry(
+                telemetry,
+                startUrl,
+                "skipped",
+                reason,
+                rootClassification.AcceptedUrls.Count,
+                rootClassification.RejectedUrls.Count,
+                acceptedPrimaryRootOverlap,
+                visibleRootChildrenBefore,
+                after,
+                CountAllFlatRootChildrenNotInTree(allFlat, treeFlat, startUrl),
+                orphanedChildren);
+        }
 
         if (!hasRootClassification)
         {
+            LogSuppressionSkipped(acceptedRootKeys.Count == 0
+                ? "no_accepted_homepage_anchors"
+                : "no_homepage_root_classification");
+
             EmitVisibleRootTelemetry(
                 telemetry,
                 startUrl,
@@ -2158,7 +2217,49 @@ public sealed class NavCrawler
                 0,
                 CountAllFlatRootChildrenNotInTree(allFlat, treeFlat, startUrl),
                 0);
-            return treeFlat;
+            return ApplyRootNavigationPurityFilter(
+                treeFlat,
+                allFlat,
+                startUrl,
+                rootClassification,
+                protectedPrimaryRootKeys,
+                log,
+                telemetry);
+        }
+
+        var acceptedAnchorCount = acceptedRootKeys.Count;
+        var sparseAcceptedAnchors = acceptedAnchorCount < 2 && visibleRootChildrenBefore >= 3;
+        var noPrimaryOverlap = acceptedPrimaryRootOverlap == 0 && visibleRootChildrenBefore > 0;
+        var lowPrimaryOverlap = visibleRootChildrenBefore >= 4
+            && acceptedPrimaryRootOverlap > 0
+            && acceptedPrimaryRootOverlap < Math.Min(2, acceptedAnchorCount);
+
+        if (sparseAcceptedAnchors)
+        {
+            LogSuppressionSkipped("sparse_homepage_anchors");
+            return ApplyRootNavigationPurityFilter(
+                treeFlat,
+                allFlat,
+                startUrl,
+                rootClassification,
+                protectedPrimaryRootKeys,
+                log,
+                telemetry);
+        }
+
+        if (noPrimaryOverlap || lowPrimaryOverlap)
+        {
+            LogSuppressionSkipped(noPrimaryOverlap
+                ? "homepage_anchors_do_not_overlap_primary_roots"
+                : "homepage_anchors_low_overlap_with_primary_roots");
+            return ApplyRootNavigationPurityFilter(
+                treeFlat,
+                allFlat,
+                startUrl,
+                rootClassification,
+                protectedPrimaryRootKeys,
+                log,
+                telemetry);
         }
 
         var suppressedRootKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -2219,9 +2320,54 @@ public sealed class NavCrawler
         var rejectedSuppressed = suppressedRootKeys.Count(k => rejectedRootKeys.Contains(k));
         var crawlableButNotVisibleRoot = CountAllFlatRootChildrenNotInTree(allFlat, visible, startUrl);
 
+        var collapsedVisibleRoots = visibleRootChildrenBefore >= 3
+            && visibleRootChildrenAfter < Math.Max(2, visibleRootChildrenBefore / 2);
+        var massiveOrphaning = orphanedChildrenAfterSuppression >= 25
+            && orphanedChildrenAfterSuppression > Math.Max(visibleRootChildrenAfter * 5, allFlat.Count / 10);
+
+        if (visibleRootChildrenAfter == 0)
+        {
+            LogSuppressionSkipped("suppression_would_empty_navigation", orphanedChildrenAfterSuppression, visibleRootChildrenAfter);
+            return ApplyRootNavigationPurityFilter(
+                treeFlat,
+                allFlat,
+                startUrl,
+                rootClassification,
+                protectedPrimaryRootKeys,
+                log,
+                telemetry);
+        }
+
+        if (collapsedVisibleRoots)
+        {
+            LogSuppressionSkipped("suppression_would_collapse_visible_roots", orphanedChildrenAfterSuppression, visibleRootChildrenAfter);
+            return ApplyRootNavigationPurityFilter(
+                treeFlat,
+                allFlat,
+                startUrl,
+                rootClassification,
+                protectedPrimaryRootKeys,
+                log,
+                telemetry);
+        }
+
+        if (massiveOrphaning)
+        {
+            LogSuppressionSkipped("suppression_would_massively_orphan_descendants", orphanedChildrenAfterSuppression, visibleRootChildrenAfter);
+            return ApplyRootNavigationPurityFilter(
+                treeFlat,
+                allFlat,
+                startUrl,
+                rootClassification,
+                protectedPrimaryRootKeys,
+                log,
+                telemetry);
+        }
+
         log?.Event("VISIBLE_ROOT_CLASSIFICATION_APPLIED",
             ("rootCandidatesAccepted", rootClassification.AcceptedUrls.Count),
             ("rootCandidatesRejected", rootClassification.RejectedUrls.Count),
+            ("acceptedPrimaryRootOverlap", acceptedPrimaryRootOverlap),
             ("visibleRootChildrenBefore", visibleRootChildrenBefore),
             ("visibleRootChildrenAfter", visibleRootChildrenAfter),
             ("rejectedCandidatesSuppressedFromVisibleRoot", rejectedSuppressed),
@@ -2239,7 +2385,398 @@ public sealed class NavCrawler
             crawlableButNotVisibleRoot,
             orphanedChildrenAfterSuppression);
 
-        return visible;
+        EmitVisibleRootGuardrailTelemetry(
+            telemetry,
+            startUrl,
+            "applied",
+            "",
+            rootClassification.AcceptedUrls.Count,
+            rootClassification.RejectedUrls.Count,
+            acceptedPrimaryRootOverlap,
+            visibleRootChildrenBefore,
+            visibleRootChildrenAfter,
+            crawlableButNotVisibleRoot,
+            orphanedChildrenAfterSuppression);
+
+        return ApplyRootNavigationPurityFilter(
+            visible,
+            allFlat,
+            startUrl,
+            rootClassification,
+            protectedPrimaryRootKeys,
+            log,
+            telemetry);
+    }
+
+    private static List<NavItem> ApplyRootNavigationPurityFilter(
+        List<NavItem> visibleTreeFlat,
+        List<NavItem> allFlat,
+        string startUrl,
+        RootCandidateClassification rootClassification,
+        HashSet<string> protectedPrimaryRootKeys,
+        Logger? log,
+        TelemetryWriter? telemetry)
+    {
+        if (visibleTreeFlat.Count == 0)
+            return visibleTreeFlat;
+
+        var canonicalStart = CanonicalUrlKey(startUrl);
+        var acceptedHomepageKeys = rootClassification.AcceptedUrls
+            .Select(CanonicalUrlKey)
+            .Where(k => !string.IsNullOrWhiteSpace(k))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var childrenByParent = visibleTreeFlat
+            .Where(x => !string.IsNullOrWhiteSpace(x.ParentUrl))
+            .GroupBy(x => CanonicalUrlKey(x.ParentUrl), StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(g => g.Key, g => g.Select(x => CanonicalUrlKey(x.Url)).ToHashSet(StringComparer.OrdinalIgnoreCase), StringComparer.OrdinalIgnoreCase);
+
+        var rootItems = visibleTreeFlat
+            .Where(x => !CanonicalUrlKey(x.Url).Equals(canonicalStart, StringComparison.OrdinalIgnoreCase)
+                     && CanonicalUrlKey(x.ParentUrl).Equals(canonicalStart, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
+        var beforeRootCount = rootItems.Count;
+        if (beforeRootCount == 0)
+            return visibleTreeFlat;
+
+        var demotedKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var demoted = new List<(NavItem Item, double Confidence, List<string> Evidence, string Reason, bool WasPrimary, bool HadChildren, int PathSegments)>();
+        var suspiciousRemaining = 0;
+
+        foreach (var item in rootItems)
+        {
+            var itemKey = CanonicalUrlKey(item.Url);
+            var wasPrimary = protectedPrimaryRootKeys.Contains(itemKey);
+            var hadChildren = childrenByParent.TryGetValue(itemKey, out var kids) && kids.Count > 0;
+            var decision = ScoreRootNavigationPurity(item, startUrl, wasPrimary, acceptedHomepageKeys.Contains(itemKey), hadChildren);
+
+            if (decision.Demote)
+            {
+                demotedKeys.Add(itemKey);
+                demoted.Add((item, decision.Confidence, decision.Evidence, decision.Reason, wasPrimary, hadChildren, CountUrlPathSegments(item.Url)));
+                log?.Event("ROOT_NAV_ITEM_DEMOTED",
+                    ("url", item.Url),
+                    ("title", item.Title),
+                    ("reason", decision.Reason),
+                    ("confidence", decision.Confidence.ToString("0.00")),
+                    ("evidence", string.Join("|", decision.Evidence)),
+                    ("wasPrimaryNav", wasPrimary),
+                    ("hadChildren", hadChildren),
+                    ("pathSegments", CountUrlPathSegments(item.Url)),
+                    ("beforeRootCount", beforeRootCount),
+                    ("afterRootCount", beforeRootCount - demotedKeys.Count));
+
+                telemetry?.Emit(TelemetryPhase.TreeBuilding, "ROOT_NAV_ITEM_DEMOTED", TelemetrySeverity.Warning,
+                    item.Url, new Dictionary<string, object?>
+                    {
+                        ["title"] = item.Title,
+                        ["reason"] = decision.Reason,
+                        ["confidence"] = decision.Confidence,
+                        ["evidence"] = decision.Evidence,
+                        ["wasPrimaryNav"] = wasPrimary,
+                        ["hadChildren"] = hadChildren,
+                        ["pathSegments"] = CountUrlPathSegments(item.Url),
+                        ["beforeRootCount"] = beforeRootCount,
+                        ["afterRootCount"] = beforeRootCount - demotedKeys.Count
+                    });
+
+                if (decision.Evidence.Any(x => x.Equals("content_archive_or_service_root", StringComparison.OrdinalIgnoreCase)
+                                            || x.Equals("homepage_alias_root", StringComparison.OrdinalIgnoreCase)))
+                {
+                    log?.Event("ROOT_NAV_PROMO_LEAK_DEMOTED",
+                        ("url", item.Url),
+                        ("title", item.Title),
+                        ("reason", decision.Reason),
+                        ("confidence", decision.Confidence.ToString("0.00")),
+                        ("evidence", string.Join("|", decision.Evidence)),
+                        ("wasPrimaryNav", wasPrimary),
+                        ("hadChildren", hadChildren),
+                        ("pathSegments", CountUrlPathSegments(item.Url)),
+                        ("beforeRootCount", beforeRootCount),
+                        ("afterRootCount", beforeRootCount - demotedKeys.Count));
+
+                    telemetry?.Emit(TelemetryPhase.TreeBuilding, "ROOT_NAV_PROMO_LEAK_DEMOTED", TelemetrySeverity.Warning,
+                        item.Url, new Dictionary<string, object?>
+                        {
+                            ["title"] = item.Title,
+                            ["reason"] = decision.Reason,
+                            ["confidence"] = decision.Confidence,
+                            ["evidence"] = decision.Evidence,
+                            ["wasPrimaryNav"] = wasPrimary,
+                            ["hadChildren"] = hadChildren,
+                            ["pathSegments"] = CountUrlPathSegments(item.Url),
+                            ["beforeRootCount"] = beforeRootCount,
+                            ["afterRootCount"] = beforeRootCount - demotedKeys.Count
+                        });
+                }
+            }
+            else if (!wasPrimary && !hadChildren && decision.Confidence >= 0.5)
+            {
+                suspiciousRemaining++;
+            }
+        }
+
+        if (demotedKeys.Count == 0)
+        {
+            if (suspiciousRemaining > 0)
+            {
+                log?.Warn($"ROOT_NAV_QUALITY_WARNING suspiciousArticleLikeRootChildren={suspiciousRemaining} beforeRootCount={beforeRootCount}");
+                telemetry?.Emit(TelemetryPhase.TreeBuilding, "ROOT_NAV_QUALITY_WARNING", TelemetrySeverity.Warning,
+                    startUrl, new Dictionary<string, object?>
+                    {
+                        ["suspiciousArticleLikeRootChildren"] = suspiciousRemaining,
+                        ["beforeRootCount"] = beforeRootCount,
+                        ["afterRootCount"] = beforeRootCount
+                    });
+            }
+            return visibleTreeFlat;
+        }
+
+        var afterRootCount = beforeRootCount - demotedKeys.Count;
+        if (beforeRootCount >= 5 && afterRootCount < 3)
+        {
+            log?.Warn($"ROOT_NAV_PURITY_FILTER_SKIPPED reason=would_collapse_navigation beforeRootCount={beforeRootCount} afterRootCount={afterRootCount} demoted={demotedKeys.Count}");
+            telemetry?.Emit(TelemetryPhase.TreeBuilding, "ROOT_NAV_PURITY_FILTER_SKIPPED", TelemetrySeverity.Warning,
+                startUrl, new Dictionary<string, object?>
+                {
+                    ["reason"] = "would_collapse_navigation",
+                    ["beforeRootCount"] = beforeRootCount,
+                    ["afterRootCount"] = afterRootCount,
+                    ["demotedCount"] = demotedKeys.Count
+                });
+            return visibleTreeFlat;
+        }
+
+        var filtered = visibleTreeFlat
+            .Where(x => !demotedKeys.Contains(CanonicalUrlKey(x.Url)))
+            .ToList();
+
+        log?.Event("ROOT_NAV_PURITY_FILTER_APPLIED",
+            ("beforeRootCount", beforeRootCount),
+            ("afterRootCount", afterRootCount),
+            ("demotedCount", demotedKeys.Count),
+            ("suspiciousRemaining", suspiciousRemaining),
+            ("sampleDemoted", string.Join(" | ", demoted.Take(6).Select(x => x.Item.Title))));
+
+        telemetry?.Emit(TelemetryPhase.TreeBuilding, "ROOT_NAV_PURITY_FILTER_APPLIED", TelemetrySeverity.Info,
+            startUrl, new Dictionary<string, object?>
+            {
+                ["beforeRootCount"] = beforeRootCount,
+                ["afterRootCount"] = afterRootCount,
+                ["demotedCount"] = demotedKeys.Count,
+                ["suspiciousRemaining"] = suspiciousRemaining,
+                ["sampleDemoted"] = demoted.Take(6).Select(x => x.Item.Title).ToArray()
+            });
+
+        return filtered;
+    }
+
+    private sealed record RootNavigationPurityDecision(
+        bool Demote,
+        double Confidence,
+        string Reason,
+        List<string> Evidence);
+
+    private static RootNavigationPurityDecision ScoreRootNavigationPurity(
+        NavItem item,
+        string startUrl,
+        bool wasPrimaryNav,
+        bool wasAcceptedHomepageAnchor,
+        bool hadChildren)
+    {
+        var evidence = new List<string>();
+        var score = 0.0;
+
+        if (wasPrimaryNav)
+            return new RootNavigationPurityDecision(false, 0, "protected_primary_nav_root", new List<string> { "primary_nav_root" });
+
+        if (item.IsSynthetic)
+            return new RootNavigationPurityDecision(false, 0, "synthetic_helper_root", new List<string> { "synthetic_helper_root" });
+
+        if (IsStartPageAlias(item.Url, startUrl))
+        {
+            return new RootNavigationPurityDecision(
+                true,
+                1.0,
+                "homepage_alias_root",
+                new List<string> { "homepage_alias_root" });
+        }
+
+        if (item.IsUtility || IsUtilityPage(item.Url, item.Title))
+            return new RootNavigationPurityDecision(false, 0, "utility_root_grouped_separately", new List<string> { "utility_root" });
+
+        var strongContentRootEvidence = false;
+        if (hadChildren)
+            score -= AddRootPurityEvidence(evidence, "has_children", 0.3);
+        else
+            score += AddRootPurityEvidence(evidence, "leaf_root_child", 0.25);
+
+        if (wasAcceptedHomepageAnchor)
+            score += AddRootPurityEvidence(evidence, "homepage_anchor_not_primary_nav", 0.25);
+
+        if (IsDatedOrArticleLikeUrl(item.Url))
+            score += AddRootPurityEvidence(evidence, "article_news_event_or_service_path", 0.45);
+
+        if (IsRootContentArchiveOrServiceSection(item.Url, item.Title))
+        {
+            score += AddRootPurityEvidence(evidence, "content_archive_or_service_root", 0.75);
+            strongContentRootEvidence = true;
+        }
+
+        if (IsArticleLikeRootTitle(item.Title))
+            score += AddRootPurityEvidence(evidence, "article_like_or_temporary_title", 0.25);
+
+        if (IsTopLevelSiteVisionNumericPage(item.Url))
+            score += AddRootPurityEvidence(evidence, "top_level_sitevision_numeric_page", 0.20);
+
+        if (IsLikelyMunicipalRootTitleOrPath(item.Title, item.Url))
+            score -= AddRootPurityEvidence(evidence, "municipal_section_like_title_or_path", 0.35);
+
+        score = Clamp01(score);
+        var demote = score >= 0.65 && (!hadChildren || strongContentRootEvidence);
+        return new RootNavigationPurityDecision(
+            demote,
+            score,
+            demote ? "article_or_homepage_promo_root" : "insufficient_promo_evidence",
+            evidence);
+    }
+
+    private static double AddRootPurityEvidence(List<string> evidence, string label, double weight)
+    {
+        evidence.Add(label);
+        return weight;
+    }
+
+    private static bool IsTopLevelSiteVisionNumericPage(string url)
+    {
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var u)) return false;
+        var path = NormalizePath(u.AbsolutePath);
+        var segments = path.Trim('/').Split('/', StringSplitOptions.RemoveEmptyEntries);
+        if (segments.Length != 1) return false;
+        var segment = segments[0];
+        if (!segment.EndsWith(".html", StringComparison.OrdinalIgnoreCase)) return false;
+        var dot = segment.LastIndexOf('.');
+        if (dot <= 0) return false;
+        var stem = segment[..dot];
+        var stemDot = stem.LastIndexOf('.');
+        if (stemDot <= 0) return false;
+        var suffix = stem[(stemDot + 1)..];
+        return suffix.Length > 0 && suffix.All(char.IsDigit);
+    }
+
+    private static bool IsProtectedPrimaryRootCandidate(string url, string title, string startUrl)
+    {
+        if (string.IsNullOrWhiteSpace(url)) return false;
+        if (IsStartPageAlias(url, startUrl)) return false;
+        if (IsUtilityPage(url, title)) return false;
+        if (IsRootContentArchiveOrServiceSection(url, title)) return false;
+        return IsLikelyMunicipalRootTitleOrPath(title, url);
+    }
+
+    private static bool IsStartPageAlias(string url, string startUrl)
+    {
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var u)) return false;
+        if (!Uri.TryCreate(startUrl, UriKind.Absolute, out var s)) return false;
+        if (!u.Host.Equals(s.Host, StringComparison.OrdinalIgnoreCase)) return false;
+
+        var path = NormalizePath(u.AbsolutePath).Trim('/');
+        if (string.IsNullOrWhiteSpace(path)) return false;
+        return path.Equals("index.html", StringComparison.OrdinalIgnoreCase)
+            || path.Equals("index.htm", StringComparison.OrdinalIgnoreCase)
+            || path.Equals("startsida", StringComparison.OrdinalIgnoreCase)
+            || path.Equals("start", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsRootContentArchiveOrServiceSection(string url, string title)
+    {
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var u)) return false;
+        var path = NormalizePath(u.AbsolutePath).Trim('/').ToLowerInvariant();
+        if (string.IsNullOrWhiteSpace(path)) return false;
+
+        var titleLower = (title ?? "").ToLowerInvariant();
+        var pathSegments = path.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        var contentSectionTokens = new[]
+        {
+            "arkiv", "nyhet", "nyheter", "huvudnyheter", "evenemang",
+            "kalender", "aktuellt", "servicemeddelanden", "drift",
+            "driftinformation", "press", "kampanj"
+        };
+
+        if (pathSegments.Length <= 2
+            && contentSectionTokens.Any(t => path.Contains(t, StringComparison.OrdinalIgnoreCase)))
+            return true;
+
+        var contentTitleTokens = new[]
+        {
+            "nyheter", "huvudnyheter", "evenemang", "aktuellt",
+            "servicemeddelanden", "driftinformation"
+        };
+        return pathSegments.Length <= 2
+            && contentTitleTokens.Any(t => titleLower.Contains(t, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool IsArticleLikeRootTitle(string title)
+    {
+        var t = (title ?? "").Trim().ToLowerInvariant();
+        if (t.Length == 0) return false;
+        if (t.Length >= 55) return true;
+        if (System.Text.RegularExpressions.Regex.IsMatch(t, @"\b20\d{2}\b")) return true;
+
+        var promoTokens = new[]
+        {
+            "sommarlov", "lov i ", "aktivitet", "aktiviteter", "firande",
+            "pris", "prisas", "bidrag", "utryckning", "markarbeten",
+            "underhÃ¥ll", "underhall", "schema", "aktuellt just nu"
+        };
+        return promoTokens.Any(x => t.Contains(x, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool IsLikelyMunicipalRootTitleOrPath(string title, string url)
+    {
+        var text = ((title ?? "") + " " + (url ?? "")).ToLowerInvariant();
+        var sectionTokens = new[]
+        {
+            "barn", "utbildning", "skola", "omsorg", "hjÃ¤lp", "hjalp",
+            "uppleva", "gÃ¶ra", "gora", "bygga", "bo", "miljÃ¶", "miljo",
+            "trafik", "resor", "jobb", "fÃ¶retag", "foretag",
+            "nÃ¤ringsliv", "naringsliv", "kommun", "politik", "arbete",
+            "infrastruktur"
+        };
+
+        return sectionTokens.Count(x => text.Contains(x, StringComparison.OrdinalIgnoreCase)) >= 2;
+    }
+
+    private static void EmitVisibleRootGuardrailTelemetry(
+        TelemetryWriter? telemetry,
+        string startUrl,
+        string decision,
+        string reason,
+        int rootCandidatesAccepted,
+        int rootCandidatesRejected,
+        int acceptedPrimaryRootOverlap,
+        int visibleRootChildrenBefore,
+        int visibleRootChildrenAfter,
+        int crawlableButNotVisibleRoot,
+        int orphanedChildrenAfterSuppression)
+    {
+        var severity = decision.Equals("skipped", StringComparison.OrdinalIgnoreCase)
+            ? TelemetrySeverity.Warning
+            : TelemetrySeverity.Info;
+
+        telemetry?.Emit(TelemetryPhase.TreeBuilding, "visible_root_suppression_guardrail", severity,
+            startUrl, new Dictionary<string, object?>
+            {
+                ["decision"] = decision,
+                ["reason"] = reason,
+                ["rootCandidatesAccepted"] = rootCandidatesAccepted,
+                ["rootCandidatesRejected"] = rootCandidatesRejected,
+                ["acceptedPrimaryRootOverlap"] = acceptedPrimaryRootOverlap,
+                ["visibleRootChildrenBefore"] = visibleRootChildrenBefore,
+                ["visibleRootChildrenAfter"] = visibleRootChildrenAfter,
+                ["crawlableButNotVisibleRoot"] = crawlableButNotVisibleRoot,
+                ["orphanedChildrenAfterSuppression"] = orphanedChildrenAfterSuppression
+            });
     }
 
     private static void EmitVisibleRootTelemetry(
@@ -2355,6 +2892,13 @@ public sealed class NavCrawler
         if (t.StartsWith("http://", StringComparison.OrdinalIgnoreCase)) return true;
         if (t.StartsWith("https://", StringComparison.OrdinalIgnoreCase)) return true;
         if (t.StartsWith("/", StringComparison.Ordinal)) return true;
+        if (Uri.TryCreate(url, UriKind.Absolute, out var u))
+        {
+            var host = u.Host.Trim();
+            if (t.Equals(host, StringComparison.OrdinalIgnoreCase)) return true;
+            if (host.StartsWith("www.", StringComparison.OrdinalIgnoreCase)
+                && t.Equals(host[4..], StringComparison.OrdinalIgnoreCase)) return true;
+        }
         return !string.IsNullOrWhiteSpace(url) && t.Equals(url, StringComparison.OrdinalIgnoreCase);
     }
 
