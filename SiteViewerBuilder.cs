@@ -94,7 +94,7 @@ public sealed class SiteViewerBuilder
         var hasScreenshots = Directory.Exists(shotsDir)
             && Directory.EnumerateFiles(shotsDir, "*.webp", SearchOption.TopDirectoryOnly).Any();
 
-        var viewerHtml = BuildViewerHtml(host, startUrl, nav, _cfg.DropQueryStrings, hasScreenshots);
+        var viewerHtml = BuildViewerHtml(host, startUrl, nav, _cfg.DropQueryStrings, hasScreenshots, _log);
         await File.WriteAllTextAsync(viewerPath, viewerHtml, Encoding.UTF8);
     }
 
@@ -161,7 +161,7 @@ public sealed class SiteViewerBuilder
         return s;
     }
 
-    private static string BuildViewerHtml(string host, string startUrl, NavIndex nav, bool dropQueryStrings, bool hasScreenshots = true)
+    private static string BuildViewerHtml(string host, string startUrl, NavIndex nav, bool dropQueryStrings, bool hasScreenshots = true, Logger? log = null)
     {
         static string E(string s) => System.Net.WebUtility.HtmlEncode(s ?? "");
 
@@ -399,18 +399,128 @@ public sealed class SiteViewerBuilder
             .Select(hs => Utils.NormalizeUrl(hs.Url, dropQueryStrings).ToLowerInvariant())
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
+        var primaryRootUrlsLower = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var primaryGroup = nav.NavGroups?
+            .OrderBy(g => g.Rank)
+            .ThenByDescending(g => g.LinkCount)
+            .FirstOrDefault();
+        if (primaryGroup?.Flat != null)
+        {
+            foreach (var item in primaryGroup.Flat)
+            {
+                if (string.IsNullOrWhiteSpace(item.Url)) continue;
+                primaryRootUrlsLower.Add(Utils.NormalizeUrl(item.Url, dropQueryStrings).ToLowerInvariant());
+            }
+        }
+
+        var structuralRootUrlsLower = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        var flatByUrlLower = flat
+            .Where(x => !string.IsNullOrWhiteSpace(x.Url))
+            .GroupBy(x => Utils.NormalizeUrl(x.Url, dropQueryStrings).ToLowerInvariant(), StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
+
+        if (nodes.Count > 0)
+        {
+            var rootChildren = nodes[0].Children ?? new List<NavNode>();
+            var beforeRootCount = rootChildren.Count;
+            foreach (var child in rootChildren)
+            {
+                if (string.IsNullOrWhiteSpace(child.Url)) continue;
+                var key = Utils.NormalizeUrl(child.Url, dropQueryStrings).ToLowerInvariant();
+                flatByUrlLower.TryGetValue(key, out var flatItem);
+                var item = flatItem ?? new NavItem { Url = child.Url, Title = child.Title };
+                var decision = MunicipalRootClassifier.Classify(item, new MunicipalRootContext
+                {
+                    StartUrl = startAbs,
+                    WasPrimaryNav = primaryRootUrlsLower.Contains(key),
+                    WasAcceptedHomepageAnchor = homepageSectionUrlsLower.Contains(key),
+                    HadChildren = (child.Children?.Count ?? 0) > 0,
+                    SourceGroup = "viewer_root_grouping",
+                    BeforeRootCount = beforeRootCount
+                });
+
+                log?.Event("MUNICIPAL_ROOT_CLASSIFIED",
+                    ("title", child.Title),
+                    ("url", child.Url),
+                    ("classification", decision.KindName),
+                    ("confidence", decision.Confidence.ToString("0.00")),
+                    ("reasons", string.Join("|", decision.Reasons)),
+                    ("evidence", string.Join("|", decision.EvidenceSignals)),
+                    ("sourceSignals", string.Join("|", decision.SourceSignals)),
+                    ("wasPrimaryNav", primaryRootUrlsLower.Contains(key)),
+                    ("hadChildren", (child.Children?.Count ?? 0) > 0),
+                    ("sourceGroup", "viewer_root_grouping"),
+                    ("beforeRootCount", beforeRootCount),
+                    ("afterRootCount", beforeRootCount));
+
+                if (decision.IsEligible)
+                {
+                    structuralRootUrlsLower.Add(key);
+                    log?.Event("MUNICIPAL_ROOT_ACCEPTED",
+                        ("title", child.Title),
+                        ("url", child.Url),
+                        ("classification", decision.KindName),
+                        ("confidence", decision.Confidence.ToString("0.00")),
+                        ("reasons", string.Join("|", decision.Reasons)),
+                        ("wasPrimaryNav", primaryRootUrlsLower.Contains(key)),
+                        ("hadChildren", (child.Children?.Count ?? 0) > 0),
+                        ("sourceGroup", "viewer_root_grouping"),
+                        ("beforeRootCount", beforeRootCount),
+                        ("afterRootCount", structuralRootUrlsLower.Count));
+                }
+                else
+                {
+                    if (decision.Kind == MunicipalRootClassificationKind.UtilityRoot)
+                        utilityUrlsLower.Add(key);
+                    else
+                        item.MunicipalRootClassification = decision.KindName;
+
+                    log?.Event("MUNICIPAL_ROOT_DEMOTED",
+                        ("title", child.Title),
+                        ("url", child.Url),
+                        ("classification", decision.KindName),
+                        ("confidence", decision.Confidence.ToString("0.00")),
+                        ("reasons", string.Join("|", decision.Reasons)),
+                        ("evidence", string.Join("|", decision.EvidenceSignals)),
+                        ("wasPrimaryNav", primaryRootUrlsLower.Contains(key)),
+                        ("hadChildren", (child.Children?.Count ?? 0) > 0),
+                        ("sourceGroup", "viewer_root_grouping"),
+                        ("beforeRootCount", beforeRootCount),
+                        ("afterRootCount", structuralRootUrlsLower.Count));
+                }
+            }
+
+            log?.Event("MUNICIPAL_ROOT_POLICY_SUMMARY",
+                ("beforeRootCount", beforeRootCount),
+                ("afterRootCount", structuralRootUrlsLower.Count),
+                ("acceptedCount", structuralRootUrlsLower.Count),
+                ("demotedCount", beforeRootCount - structuralRootUrlsLower.Count));
+        }
+
         // Discovered/root helper buckets are reserved for explicit synthetic
-        // roots such as "Ovrigt". Do not demote legitimate primary nav roots
-        // merely because homepage card extraction accepted few or no anchors.
+        // roots and policy-demoted root children. Do not remove these from the
+        // archive; only keep them out of primary municipal Navigation.
         var discoveredUrlsLower = flat
             .Where(x => !string.IsNullOrWhiteSpace(x.Url)
                      && !string.IsNullOrWhiteSpace(x.ParentUrl)
                      && x.ParentUrl.Equals(startAbs, StringComparison.OrdinalIgnoreCase)
                      && !x.Url.Equals(startAbs, StringComparison.OrdinalIgnoreCase)
-                     && x.IsSynthetic
+                     && (x.IsSynthetic || !string.IsNullOrWhiteSpace(x.MunicipalRootClassification))
                      && !x.IsUtility)
             .Select(x => Utils.NormalizeUrl(x.Url, dropQueryStrings).ToLowerInvariant())
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        if (nodes.Count > 0)
+        {
+            foreach (var child in nodes[0].Children ?? new List<NavNode>())
+            {
+                if (string.IsNullOrWhiteSpace(child.Url)) continue;
+                var key = Utils.NormalizeUrl(child.Url, dropQueryStrings).ToLowerInvariant();
+                if (!structuralRootUrlsLower.Contains(key) && !utilityUrlsLower.Contains(key))
+                    discoveredUrlsLower.Add(key);
+            }
+        }
 
         // Homepage sections ordered by DOM position for Phase 2 viewer ordering.
         var homepageSectionsJs = homepageSections
@@ -422,6 +532,7 @@ public sealed class SiteViewerBuilder
             })
             .ToList();
 
+        var structuralRootUrlsJson = JsonSerializer.Serialize(structuralRootUrlsLower.ToArray());
         var utilityUrlsJson      = JsonSerializer.Serialize(utilityUrlsLower.ToArray());
         var discoveredUrlsJson   = JsonSerializer.Serialize(discoveredUrlsLower.ToArray());
         var homepageSectionsJson = JsonSerializer.Serialize(homepageSectionsJs);
@@ -534,6 +645,7 @@ public sealed class SiteViewerBuilder
         sb.AppendLine("    (function(){");
         sb.Append("      const treeData = ").Append(treeJson).AppendLine(";");
         sb.Append("      const visibleGroups = ").Append(visibleJson).AppendLine(";");
+        sb.Append("      const structuralRootUrls = new Set(").Append(structuralRootUrlsJson).AppendLine(");");
         sb.Append("      const utilityUrls = new Set(").Append(utilityUrlsJson).AppendLine(");");
         sb.Append("      const discoveredUrls = new Set(").Append(discoveredUrlsJson).AppendLine(");");
         sb.Append("      const homepageSections = ").Append(homepageSectionsJson).AppendLine(";");
@@ -643,7 +755,8 @@ public sealed class SiteViewerBuilder
         sb.AppendLine("          const structural = [], utility = [], discovered = [];");
         sb.AppendLine("          for (const kid of rootKids) {");
         sb.AppendLine("            const ku = normUrl(kid.url || '');");
-        sb.AppendLine("            if (utilityUrls.has(ku)) utility.push(kid);");
+        sb.AppendLine("            if (structuralRootUrls.has(ku)) structural.push(kid);");
+        sb.AppendLine("            else if (utilityUrls.has(ku)) utility.push(kid);");
         sb.AppendLine("            else if (discoveredUrls.has(ku)) discovered.push(kid);");
         sb.AppendLine("            else structural.push(kid);");
         sb.AppendLine("          }");

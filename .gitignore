@@ -440,3 +440,10 @@ FodyWeavers.xsd
 /output/
 /overnight_batch/
 /Analysis/
+sites_overnight_real.txt
+sites_precaution_run.txt
+sites_root_purity_klippan_validate.txt
+sites_topology_validate.txt
+sites_root_purity_validate.txt
+_audit_screenshot.csx
+_audit_tool/audit_tool.csproj

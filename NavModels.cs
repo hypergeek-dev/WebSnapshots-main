@@ -121,6 +121,13 @@ public sealed class NavItem
     [System.Text.Json.Serialization.JsonIgnore(
         Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingDefault)]
     public bool IsUtility { get; set; } = false;
+
+    // Root-placement policy result. This keeps demoted archive content visible
+    // and searchable while letting the viewer avoid placing it in primary
+    // municipal Navigation.
+    [System.Text.Json.Serialization.JsonIgnore(
+        Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingDefault)]
+    public string MunicipalRootClassification { get; set; } = "";
 }
 
 public sealed class NavNode

@@ -2440,212 +2440,154 @@ public sealed class NavCrawler
         if (beforeRootCount == 0)
             return visibleTreeFlat;
 
-        var demotedKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var demoted = new List<(NavItem Item, double Confidence, List<string> Evidence, string Reason, bool WasPrimary, bool HadChildren, int PathSegments)>();
-        var suspiciousRemaining = 0;
+        var accepted = 0;
+        var demoted = 0;
+        var warningClassifications = new HashSet<MunicipalRootClassificationKind>
+        {
+            MunicipalRootClassificationKind.MicrositeRoot,
+            MunicipalRootClassificationKind.NewsOrEventRoot,
+            MunicipalRootClassificationKind.ErrorOrSystemRoot,
+            MunicipalRootClassificationKind.UtilityRoot
+        };
 
         foreach (var item in rootItems)
         {
             var itemKey = CanonicalUrlKey(item.Url);
             var wasPrimary = protectedPrimaryRootKeys.Contains(itemKey);
             var hadChildren = childrenByParent.TryGetValue(itemKey, out var kids) && kids.Count > 0;
-            var decision = ScoreRootNavigationPurity(item, startUrl, wasPrimary, acceptedHomepageKeys.Contains(itemKey), hadChildren);
-
-            if (decision.Demote)
+            var decision = MunicipalRootClassifier.Classify(item, new MunicipalRootContext
             {
-                demotedKeys.Add(itemKey);
-                demoted.Add((item, decision.Confidence, decision.Evidence, decision.Reason, wasPrimary, hadChildren, CountUrlPathSegments(item.Url)));
-                log?.Event("ROOT_NAV_ITEM_DEMOTED",
-                    ("url", item.Url),
+                StartUrl = startUrl,
+                WasPrimaryNav = wasPrimary,
+                WasAcceptedHomepageAnchor = acceptedHomepageKeys.Contains(itemKey),
+                HadChildren = hadChildren,
+                SourceGroup = "visible_tree_root",
+                BeforeRootCount = beforeRootCount
+            });
+
+            item.MunicipalRootClassification = decision.KindName;
+            if (decision.Kind == MunicipalRootClassificationKind.UtilityRoot)
+                item.IsUtility = true;
+
+            log?.Event("MUNICIPAL_ROOT_CLASSIFIED",
+                ("title", item.Title),
+                ("url", item.Url),
+                ("classification", decision.KindName),
+                ("confidence", decision.Confidence.ToString("0.00")),
+                ("reasons", string.Join("|", decision.Reasons)),
+                ("evidence", string.Join("|", decision.EvidenceSignals)),
+                ("sourceSignals", string.Join("|", decision.SourceSignals)),
+                ("wasPrimaryNav", wasPrimary),
+                ("hadChildren", hadChildren),
+                ("sourceGroup", "visible_tree_root"),
+                ("beforeRootCount", beforeRootCount),
+                ("afterRootCount", beforeRootCount - demoted));
+
+            telemetry?.Emit(TelemetryPhase.TreeBuilding, "MUNICIPAL_ROOT_CLASSIFIED", TelemetrySeverity.Info,
+                item.Url, new Dictionary<string, object?>
+                {
+                    ["title"] = item.Title,
+                    ["classification"] = decision.KindName,
+                    ["confidence"] = decision.Confidence,
+                    ["reasons"] = decision.Reasons,
+                    ["evidenceSignals"] = decision.EvidenceSignals,
+                    ["sourceSignals"] = decision.SourceSignals,
+                    ["wasPrimaryNav"] = wasPrimary,
+                    ["hadChildren"] = hadChildren,
+                    ["sourceGroup"] = "visible_tree_root",
+                    ["beforeRootCount"] = beforeRootCount,
+                    ["afterRootCount"] = beforeRootCount - demoted
+                });
+
+            if (decision.IsEligible)
+            {
+                accepted++;
+                log?.Event("MUNICIPAL_ROOT_ACCEPTED",
                     ("title", item.Title),
-                    ("reason", decision.Reason),
+                    ("url", item.Url),
+                    ("classification", decision.KindName),
                     ("confidence", decision.Confidence.ToString("0.00")),
-                    ("evidence", string.Join("|", decision.Evidence)),
+                    ("reasons", string.Join("|", decision.Reasons)),
                     ("wasPrimaryNav", wasPrimary),
                     ("hadChildren", hadChildren),
-                    ("pathSegments", CountUrlPathSegments(item.Url)),
+                    ("sourceGroup", "visible_tree_root"),
                     ("beforeRootCount", beforeRootCount),
-                    ("afterRootCount", beforeRootCount - demotedKeys.Count));
+                    ("afterRootCount", beforeRootCount - demoted));
 
-                telemetry?.Emit(TelemetryPhase.TreeBuilding, "ROOT_NAV_ITEM_DEMOTED", TelemetrySeverity.Warning,
+                telemetry?.Emit(TelemetryPhase.TreeBuilding, "MUNICIPAL_ROOT_ACCEPTED", TelemetrySeverity.Info,
                     item.Url, new Dictionary<string, object?>
                     {
                         ["title"] = item.Title,
-                        ["reason"] = decision.Reason,
+                        ["classification"] = decision.KindName,
                         ["confidence"] = decision.Confidence,
-                        ["evidence"] = decision.Evidence,
+                        ["reasons"] = decision.Reasons,
                         ["wasPrimaryNav"] = wasPrimary,
                         ["hadChildren"] = hadChildren,
-                        ["pathSegments"] = CountUrlPathSegments(item.Url),
+                        ["sourceGroup"] = "visible_tree_root",
                         ["beforeRootCount"] = beforeRootCount,
-                        ["afterRootCount"] = beforeRootCount - demotedKeys.Count
+                        ["afterRootCount"] = beforeRootCount - demoted
                     });
-
-                if (decision.Evidence.Any(x => x.Equals("content_archive_or_service_root", StringComparison.OrdinalIgnoreCase)
-                                            || x.Equals("homepage_alias_root", StringComparison.OrdinalIgnoreCase)))
-                {
-                    log?.Event("ROOT_NAV_PROMO_LEAK_DEMOTED",
-                        ("url", item.Url),
-                        ("title", item.Title),
-                        ("reason", decision.Reason),
-                        ("confidence", decision.Confidence.ToString("0.00")),
-                        ("evidence", string.Join("|", decision.Evidence)),
-                        ("wasPrimaryNav", wasPrimary),
-                        ("hadChildren", hadChildren),
-                        ("pathSegments", CountUrlPathSegments(item.Url)),
-                        ("beforeRootCount", beforeRootCount),
-                        ("afterRootCount", beforeRootCount - demotedKeys.Count));
-
-                    telemetry?.Emit(TelemetryPhase.TreeBuilding, "ROOT_NAV_PROMO_LEAK_DEMOTED", TelemetrySeverity.Warning,
-                        item.Url, new Dictionary<string, object?>
-                        {
-                            ["title"] = item.Title,
-                            ["reason"] = decision.Reason,
-                            ["confidence"] = decision.Confidence,
-                            ["evidence"] = decision.Evidence,
-                            ["wasPrimaryNav"] = wasPrimary,
-                            ["hadChildren"] = hadChildren,
-                            ["pathSegments"] = CountUrlPathSegments(item.Url),
-                            ["beforeRootCount"] = beforeRootCount,
-                            ["afterRootCount"] = beforeRootCount - demotedKeys.Count
-                        });
-                }
             }
-            else if (!wasPrimary && !hadChildren && decision.Confidence >= 0.5)
+            else
             {
-                suspiciousRemaining++;
-            }
-        }
+                demoted++;
+                log?.Event("MUNICIPAL_ROOT_DEMOTED",
+                    ("title", item.Title),
+                    ("url", item.Url),
+                    ("classification", decision.KindName),
+                    ("confidence", decision.Confidence.ToString("0.00")),
+                    ("reasons", string.Join("|", decision.Reasons)),
+                    ("evidence", string.Join("|", decision.EvidenceSignals)),
+                    ("wasPrimaryNav", wasPrimary),
+                    ("hadChildren", hadChildren),
+                    ("sourceGroup", "visible_tree_root"),
+                    ("beforeRootCount", beforeRootCount),
+                    ("afterRootCount", beforeRootCount - demoted));
 
-        if (demotedKeys.Count == 0)
-        {
-            if (suspiciousRemaining > 0)
-            {
-                log?.Warn($"ROOT_NAV_QUALITY_WARNING suspiciousArticleLikeRootChildren={suspiciousRemaining} beforeRootCount={beforeRootCount}");
-                telemetry?.Emit(TelemetryPhase.TreeBuilding, "ROOT_NAV_QUALITY_WARNING", TelemetrySeverity.Warning,
-                    startUrl, new Dictionary<string, object?>
+                telemetry?.Emit(TelemetryPhase.TreeBuilding, "MUNICIPAL_ROOT_DEMOTED", TelemetrySeverity.Warning,
+                    item.Url, new Dictionary<string, object?>
                     {
-                        ["suspiciousArticleLikeRootChildren"] = suspiciousRemaining,
+                        ["title"] = item.Title,
+                        ["classification"] = decision.KindName,
+                        ["confidence"] = decision.Confidence,
+                        ["reasons"] = decision.Reasons,
+                        ["evidenceSignals"] = decision.EvidenceSignals,
+                        ["wasPrimaryNav"] = wasPrimary,
+                        ["hadChildren"] = hadChildren,
+                        ["sourceGroup"] = "visible_tree_root",
                         ["beforeRootCount"] = beforeRootCount,
-                        ["afterRootCount"] = beforeRootCount
+                        ["afterRootCount"] = beforeRootCount - demoted
                     });
+
+                if (warningClassifications.Contains(decision.Kind))
+                    log?.Warn($"MUNICIPAL_ROOT_WARNING classified={decision.KindName} title=\"{item.Title}\" url={item.Url}");
             }
-            return visibleTreeFlat;
         }
 
-        var afterRootCount = beforeRootCount - demotedKeys.Count;
-        if (beforeRootCount >= 5 && afterRootCount < 3)
-        {
-            log?.Warn($"ROOT_NAV_PURITY_FILTER_SKIPPED reason=would_collapse_navigation beforeRootCount={beforeRootCount} afterRootCount={afterRootCount} demoted={demotedKeys.Count}");
-            telemetry?.Emit(TelemetryPhase.TreeBuilding, "ROOT_NAV_PURITY_FILTER_SKIPPED", TelemetrySeverity.Warning,
-                startUrl, new Dictionary<string, object?>
-                {
-                    ["reason"] = "would_collapse_navigation",
-                    ["beforeRootCount"] = beforeRootCount,
-                    ["afterRootCount"] = afterRootCount,
-                    ["demotedCount"] = demotedKeys.Count
-                });
-            return visibleTreeFlat;
-        }
+        var afterRootCountForPolicy = beforeRootCount - demoted;
+        if (beforeRootCount >= 6 && demoted > beforeRootCount / 2)
+            log?.Warn($"MUNICIPAL_ROOT_WARNING excessiveRootsDemoted={demoted} beforeRootCount={beforeRootCount} afterRootCount={afterRootCountForPolicy}");
 
-        var filtered = visibleTreeFlat
-            .Where(x => !demotedKeys.Contains(CanonicalUrlKey(x.Url)))
-            .ToList();
+        if (afterRootCountForPolicy < 3 && beforeRootCount >= 5)
+            log?.Warn($"MUNICIPAL_ROOT_WARNING sparseNavigation beforeRootCount={beforeRootCount} afterRootCount={afterRootCountForPolicy}");
 
-        log?.Event("ROOT_NAV_PURITY_FILTER_APPLIED",
+        log?.Event("MUNICIPAL_ROOT_POLICY_SUMMARY",
             ("beforeRootCount", beforeRootCount),
-            ("afterRootCount", afterRootCount),
-            ("demotedCount", demotedKeys.Count),
-            ("suspiciousRemaining", suspiciousRemaining),
-            ("sampleDemoted", string.Join(" | ", demoted.Take(6).Select(x => x.Item.Title))));
+            ("afterRootCount", afterRootCountForPolicy),
+            ("acceptedCount", accepted),
+            ("demotedCount", demoted));
 
-        telemetry?.Emit(TelemetryPhase.TreeBuilding, "ROOT_NAV_PURITY_FILTER_APPLIED", TelemetrySeverity.Info,
+        telemetry?.Emit(TelemetryPhase.TreeBuilding, "MUNICIPAL_ROOT_POLICY_SUMMARY", TelemetrySeverity.Info,
             startUrl, new Dictionary<string, object?>
             {
                 ["beforeRootCount"] = beforeRootCount,
-                ["afterRootCount"] = afterRootCount,
-                ["demotedCount"] = demotedKeys.Count,
-                ["suspiciousRemaining"] = suspiciousRemaining,
-                ["sampleDemoted"] = demoted.Take(6).Select(x => x.Item.Title).ToArray()
+                ["afterRootCount"] = afterRootCountForPolicy,
+                ["acceptedCount"] = accepted,
+                ["demotedCount"] = demoted
             });
 
-        return filtered;
-    }
+        return visibleTreeFlat;
 
-    private sealed record RootNavigationPurityDecision(
-        bool Demote,
-        double Confidence,
-        string Reason,
-        List<string> Evidence);
-
-    private static RootNavigationPurityDecision ScoreRootNavigationPurity(
-        NavItem item,
-        string startUrl,
-        bool wasPrimaryNav,
-        bool wasAcceptedHomepageAnchor,
-        bool hadChildren)
-    {
-        var evidence = new List<string>();
-        var score = 0.0;
-
-        if (wasPrimaryNav)
-            return new RootNavigationPurityDecision(false, 0, "protected_primary_nav_root", new List<string> { "primary_nav_root" });
-
-        if (item.IsSynthetic)
-            return new RootNavigationPurityDecision(false, 0, "synthetic_helper_root", new List<string> { "synthetic_helper_root" });
-
-        if (IsStartPageAlias(item.Url, startUrl))
-        {
-            return new RootNavigationPurityDecision(
-                true,
-                1.0,
-                "homepage_alias_root",
-                new List<string> { "homepage_alias_root" });
-        }
-
-        if (item.IsUtility || IsUtilityPage(item.Url, item.Title))
-            return new RootNavigationPurityDecision(false, 0, "utility_root_grouped_separately", new List<string> { "utility_root" });
-
-        var strongContentRootEvidence = false;
-        if (hadChildren)
-            score -= AddRootPurityEvidence(evidence, "has_children", 0.3);
-        else
-            score += AddRootPurityEvidence(evidence, "leaf_root_child", 0.25);
-
-        if (wasAcceptedHomepageAnchor)
-            score += AddRootPurityEvidence(evidence, "homepage_anchor_not_primary_nav", 0.25);
-
-        if (IsDatedOrArticleLikeUrl(item.Url))
-            score += AddRootPurityEvidence(evidence, "article_news_event_or_service_path", 0.45);
-
-        if (IsRootContentArchiveOrServiceSection(item.Url, item.Title))
-        {
-            score += AddRootPurityEvidence(evidence, "content_archive_or_service_root", 0.75);
-            strongContentRootEvidence = true;
-        }
-
-        if (IsArticleLikeRootTitle(item.Title))
-            score += AddRootPurityEvidence(evidence, "article_like_or_temporary_title", 0.25);
-
-        if (IsTopLevelSiteVisionNumericPage(item.Url))
-            score += AddRootPurityEvidence(evidence, "top_level_sitevision_numeric_page", 0.20);
-
-        if (IsLikelyMunicipalRootTitleOrPath(item.Title, item.Url))
-            score -= AddRootPurityEvidence(evidence, "municipal_section_like_title_or_path", 0.35);
-
-        score = Clamp01(score);
-        var demote = score >= 0.65 && (!hadChildren || strongContentRootEvidence);
-        return new RootNavigationPurityDecision(
-            demote,
-            score,
-            demote ? "article_or_homepage_promo_root" : "insufficient_promo_evidence",
-            evidence);
-    }
-
-    private static double AddRootPurityEvidence(List<string> evidence, string label, double weight)
-    {
-        evidence.Add(label);
-        return weight;
     }
 
     private static bool IsTopLevelSiteVisionNumericPage(string url)
@@ -2668,10 +2610,13 @@ public sealed class NavCrawler
     private static bool IsProtectedPrimaryRootCandidate(string url, string title, string startUrl)
     {
         if (string.IsNullOrWhiteSpace(url)) return false;
-        if (IsStartPageAlias(url, startUrl)) return false;
-        if (IsUtilityPage(url, title)) return false;
-        if (IsRootContentArchiveOrServiceSection(url, title)) return false;
-        return IsLikelyMunicipalRootTitleOrPath(title, url);
+        return MunicipalRootClassifier.IsEligibleMunicipalRoot(
+            url,
+            title,
+            startUrl,
+            wasPrimaryNav: true,
+            hadChildren: true,
+            sourceGroup: "primary_nav_candidate");
     }
 
     private static bool IsStartPageAlias(string url, string startUrl)
@@ -3576,6 +3521,9 @@ public sealed class NavCrawler
 
     private static bool IsUtilityPage(string url, string title)
     {
+        return MunicipalRootClassifier.IsUtilityPage(url, title);
+
+#pragma warning disable CS0162
         string path = "";
         try { path = new Uri(url).AbsolutePath.ToLowerInvariant(); } catch { }
         var t = (title ?? "").ToLowerInvariant();
@@ -3602,6 +3550,7 @@ public sealed class NavCrawler
             if (t.Contains(kw, StringComparison.Ordinal)) return true;
 
         return false;
+#pragma warning restore CS0162
     }
 
     // Returns true if the URL looks like a top-level municipal service section
@@ -3610,6 +3559,9 @@ public sealed class NavCrawler
     // to promote to the structural primary list.
     private static bool IsLikelyMunicipalSection(string url)
     {
+        return MunicipalRootClassifier.IsLikelyMunicipalSection(url);
+
+#pragma warning disable CS0162
         string path;
         try { path = new Uri(url).AbsolutePath; }
         catch { return false; }
@@ -3646,5 +3598,6 @@ public sealed class NavCrawler
             return false;
 
         return true;
+#pragma warning restore CS0162
     }
 }
