@@ -119,9 +119,19 @@ StyleCopReport.xml
 # WebSnapshots generated diagnostic/crawl outputs
 diagnostics*/
 /output*/
+output*/
+overnight*/
 /overnight_batch*/
 /overnight_batch_sitevision*/
 /archive_inventory/
+publish/
+*.zip
+*.tmp
+.tmp/
+_visual_quality_audit/
+_nav_audit_screenshots/
+_audit_tool/**/bin/
+_audit_tool/**/obj/
 
 # WebSnapshots generated analysis and audit notes
 /cleanup-plan.md
