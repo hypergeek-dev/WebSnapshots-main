@@ -20,6 +20,18 @@ The output is a visual record of rendered pages, not an HTML mirror.
 
 While WebSnapshots can archive any website, the navigation reconstruction and validation logic has primarily been developed and tested against Swedish municipal websites. Results on other website types may vary.
 
+## Validation
+
+WebSnapshots is validated against a regression fixture set consisting of:
+
+- Eslöv
+- Kristianstad
+- Ystad
+- Klippan
+- Hässleholm
+
+These fixtures are used to verify navigation topology preservation and prevent regressions in root classification and viewer rendering.
+
 ## Running the GUI
 
 For the bundled Windows release:
