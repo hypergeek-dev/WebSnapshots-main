@@ -393,31 +393,33 @@ public sealed class NavCrawler
             }
         }
 
-        // Snapshot the real primary/header roots before homepage anchors are
-        // added as crawl supplements. Homepage cards must not gain the same
-        // protection as primary navigation roots.
-        var protectedPrimaryRootSet = protectedPrimaryRootCandidates
-            .Select(CanonicalUrlKey)
-            .Where(k => !string.IsNullOrWhiteSpace(k))
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
-
-        _log.Event("NAV_PRIMARY_ROOT_PROTECTION",
-            ("protectedRootCount", protectedPrimaryRootSet.Count),
-            ("primaryCount", primaryNavUrls.Count));
-
         if (rootClassification.AcceptedUrls.Count > 0)
         {
             var acceptedRootPromoted = 0;
+            var acceptedRootSeeds = new List<string>();
+            var acceptedRootSeedSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
             foreach (var u in rootClassification.AcceptedUrls)
             {
                 if (string.IsNullOrWhiteSpace(u)) continue;
                 if (u.Equals(startAbs, StringComparison.OrdinalIgnoreCase)) continue;
+
+                protectedPrimaryRootCandidates.Add(u);
+                if (acceptedRootSeedSet.Add(u))
+                    acceptedRootSeeds.Add(u);
+
                 if (primaryNavSet.Add(u))
                 {
                     primaryNavUrls.Add(u);
                     acceptedRootPromoted++;
                 }
+            }
+
+            if (acceptedRootSeeds.Count > 0)
+            {
+                primaryNavUrls = acceptedRootSeeds
+                    .Concat(primaryNavUrls.Where(u => !acceptedRootSeedSet.Contains(u)))
+                    .ToList();
             }
 
             if (acceptedRootPromoted > 0)
@@ -433,6 +435,17 @@ public sealed class NavCrawler
                 });
             }
         }
+
+        // Homepage structural anchors are protected roots and must be visited
+        // before breadth-limited sampling of larger descendant-heavy nav groups.
+        var protectedPrimaryRootSet = protectedPrimaryRootCandidates
+            .Select(CanonicalUrlKey)
+            .Where(k => !string.IsNullOrWhiteSpace(k))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        _log.Event("NAV_PRIMARY_ROOT_PROTECTION",
+            ("protectedRootCount", protectedPrimaryRootSet.Count),
+            ("primaryCount", primaryNavUrls.Count));
 
         var allFlat = new List<NavItem>(capacity: Math.Min(opt.MaxPagesPerSite, 4096));
         var treeFlat = new List<NavItem>(capacity: Math.Min(opt.MaxPagesPerSite, 4096));
