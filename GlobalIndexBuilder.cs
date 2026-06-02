@@ -86,7 +86,9 @@ public static class GlobalIndexBuilder
                     sb.AppendLine("  <ul>");
                     foreach (var it in m.Results.OrderBy(x => x.DisplayName, StringComparer.OrdinalIgnoreCase))
                     {
-                        var viewerHref = E(it.ViewerRel);
+                        var viewerHref = E(it.Status == "OK" && !string.IsNullOrWhiteSpace(it.ViewerRel)
+                            ? it.ViewerRel
+                            : (string.IsNullOrWhiteSpace(it.EntryRel) ? it.ViewerRel : it.EntryRel));
                         if (!viewerHref.Contains('#')) viewerHref += "#start";
 
                         sb.Append("    <li><a href=\"").Append(viewerHref).Append("\">").Append(E(it.DisplayName)).Append("</a>");

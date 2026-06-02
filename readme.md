@@ -131,6 +131,12 @@ Then open:
 http://localhost:8080/
 ```
 
+To run a non-destructive output consistency report:
+
+```powershell
+WebSnapshots.exe doctor output
+```
+
 ## Bundled Playwright Chromium
 
 The Windows release package includes a Chromium browser under `browsers/`.

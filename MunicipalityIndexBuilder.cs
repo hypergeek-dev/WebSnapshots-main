@@ -110,7 +110,7 @@ a:hover{{text-decoration:underline}}
 .code{{font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; font-size:.9rem}}
 </style>
 <header>
-  <div class=""sub""><a href=""../index.htm"">← Run index</a></div>
+  <div class=""sub""><a href=""../index.htm"">← All archives</a></div>
   <h1>{E(municipalityFolderName)}</h1>
   <div class=""sub"">Scrapes: {metas.Count}</div>
   <div class=""sub"">JSON: <span class=""code"">index.json</span></div>

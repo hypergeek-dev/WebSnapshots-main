@@ -1,43 +1,47 @@
 # Regression Fixtures
 
-WebSnapshots uses a five-municipality regression fixture set to validate navigation topology preservation, root classification, and viewer rendering.
+WebSnapshots uses five validated municipal fixtures to protect root navigation topology. Visual evidence is authoritative when telemetry, generated data, and the rendered viewer disagree.
+
+Future navigation changes must validate against all five fixtures before release.
 
 ## Eslöv
 
 - CMS: WordPress / Municipio
-- Regression focus: homepage root preservation
-- Expected behavior: accepted homepage structural anchors remain visible as municipal NAVIGATION roots.
+- Regression focus: homepage-root preservation
+- Expected NAVIGATION roots:
+  - Förskola, skola och utbildning
+  - Omsorg och stöd
+  - Uppleva och göra
+  - Bygga, bo och miljö
+  - Trafik, gator och parker
+  - Arbete och arbetsmarknad
+  - Kommun och politik
 
 ## Kristianstad
 
 - CMS: SiteVision
-- Regression focus: Badrike exclusion
-- Expected behavior: `Kristianstads badrike` does not appear as a municipal NAVIGATION root.
+- `Kristianstads badrike` must not appear as a root under NAVIGATION.
+- Seven municipal roots should remain visible.
 
 ## Ystad
 
 - CMS: SiteVision
-- Regression focus: Gymnasium / Industrifastigheter exclusion
-- Expected behavior: `Ystad Gymnasium` and `Ystads Industrifastigheter` do not appear as municipal NAVIGATION roots.
+- `Ystad Gymnasium` must not appear as a root under NAVIGATION.
+- `Ystads Industrifastigheter` must not appear as a root under NAVIGATION.
+- Seven municipal roots should remain visible.
 
 ## Klippan
 
 - CMS: SiteVision
-- Regression focus: ÖVRIGT protection
-- Expected behavior: real municipal roots remain under NAVIGATION and are not swallowed by `ÖVRIGT INNEHÅLL`.
+- Real municipal roots must remain under NAVIGATION.
+- Municipal roots must not be swallowed by ÖVRIGT.
 
 ## Hässleholm
 
 - CMS: SiteVision
-- Regression focus: Anslagstavla validation
-- Expected behavior: `Anslagstavla` remains visible when it is genuinely authored as part of the municipality's primary information architecture.
+- `Anslagstavla` is allowed as a root when it is authored as primary information architecture.
+- Do not introduce a blanket `Anslagstavla` demotion.
 
-## Release Validation
+## Validation Rule
 
-Before releasing navigation changes:
-
-1. Run a bounded diagnostic for every fixture.
-2. Generate navigation artifacts and an expanded viewer audit.
-3. Review `rendered-root-navigation.txt`, `expanded-visible-nav-text.txt`, and expanded screenshots.
-4. Treat visual evidence as authoritative when telemetry and viewer output disagree.
-5. Keep the navigation system release-frozen unless a regression is proven.
+Fixture expectations protect rendered root navigation topology. Review the generated viewer, expanded visual audit screenshots, `rendered-root-navigation.txt`, and `expanded-visible-nav-text.txt`. Treat visual evidence as authoritative.

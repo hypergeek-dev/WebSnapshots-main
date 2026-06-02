@@ -57,8 +57,21 @@ public static class AtomicWrite
     {
         if (File.Exists(finalPath))
         {
-            // True atomic replace on Windows
-            File.Replace(tempPath, finalPath, null);
+            try
+            {
+                // Prefer a true atomic replacement on Windows.
+                File.Replace(tempPath, finalPath, null);
+            }
+            catch (IOException)
+            {
+                // Some filesystems or transient file handles reject File.Replace.
+                // Keep the same-directory temp file and use overwrite move as a fallback.
+                File.Move(tempPath, finalPath, overwrite: true);
+            }
+            catch (UnauthorizedAccessException)
+            {
+                File.Move(tempPath, finalPath, overwrite: true);
+            }
         }
         else
         {
