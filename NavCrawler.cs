@@ -572,7 +572,11 @@ public sealed class NavCrawler
         var sw = System.Diagnostics.Stopwatch.StartNew();
         var lastProgress = DateTimeOffset.Now;
         var maxPagesReachedBeforeDedupe = false;
+        var promotedIntermediateUrls = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var successfullyVisitedUrls = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var nextMissingIntermediatePromotionCheck = 100;
 
+DrainNavigationQueue:
         while (q.Count > 0)
         {
             ct.ThrowIfCancellationRequested();
@@ -676,6 +680,8 @@ public sealed class NavCrawler
 
             if (visitSucceeded)
             {
+                successfullyVisitedUrls.Add(item.Url);
+
                 _telemetry?.Emit(TelemetryPhase.Crawl, "page_visit_success", TelemetrySeverity.Info,
                     item.Url, new Dictionary<string, object?>
                     {
@@ -904,6 +910,41 @@ public sealed class NavCrawler
                     ("maxPages", opt.MaxPagesPerSite),
                     ("elapsedSec", (int)sw.Elapsed.TotalSeconds));
             }
+
+            if (allFlat.Count >= nextMissingIntermediatePromotionCheck)
+            {
+                QueueStrongMissingIntermediateCandidates(
+                    allFlat,
+                    q,
+                    discovered,
+                    visited,
+                    bestParentByUrl,
+                    bestStructuralByUrl,
+                    promotedIntermediateUrls,
+                    startAbs,
+                    opt,
+                    _log,
+                    _telemetry);
+
+                nextMissingIntermediatePromotionCheck = allFlat.Count + 100;
+            }
+
+        }
+
+        if (QueueStrongMissingIntermediateCandidates(
+            allFlat,
+            q,
+            discovered,
+            visited,
+            bestParentByUrl,
+            bestStructuralByUrl,
+            promotedIntermediateUrls,
+            startAbs,
+            opt,
+            _log,
+            _telemetry) > 0)
+        {
+            goto DrainNavigationQueue;
         }
 
         // Post-crawl URL-path reparenting pass.
@@ -917,6 +958,20 @@ public sealed class NavCrawler
         // For WordPress/Municipio, a second URL-path-based strategy handles clean-slug URLs
         // where intermediate section pages may not be in treeFlat.
         ReparentOrphansByUrlPath(allFlat, treeFlat, treeFlatEdges, startAbs, homepageSections, _log, _telemetry);
+
+        // Pattern A promotion pass.
+        // Missing intermediates promoted during BFS are real crawled pages rather than
+        // synthetic placeholders. Attach descendants only under promoted URLs whose visit
+        // succeeded, preserving the synthetic fallback for failed or weak candidates.
+        ReparentItemsUnderPromotedIntermediatePages(
+            allFlat,
+            treeFlat,
+            treeFlatEdges,
+            startAbs,
+            promotedIntermediateUrls,
+            successfullyVisitedUrls,
+            _log,
+            _telemetry);
 
         // Synthetic intermediate parent pass.
         // When the URL-path reparenting pass above still leaves deep pages (path depth ≥ 2)
@@ -1588,6 +1643,253 @@ public sealed class NavCrawler
             return false;
 
         return childPath.StartsWith(parentSection + "/", StringComparison.OrdinalIgnoreCase);
+    }
+
+    // Promotes strongly evidenced missing URL-prefix parents into the BFS queue.
+    //
+    // This runs at bounded intervals and when the current queue drains. It reuses the
+    // synthetic-parent confidence rules, but gives accepted prefixes a bounded chance
+    // to become real crawled pages before the post-crawl synthetic fallback runs.
+    private static int QueueStrongMissingIntermediateCandidates(
+        List<NavItem> allFlat,
+        Queue<QItem> queue,
+        HashSet<string> discovered,
+        HashSet<string> visited,
+        Dictionary<string, string> bestParentByUrl,
+        Dictionary<string, bool> bestStructuralByUrl,
+        HashSet<string> promotedIntermediateUrls,
+        string startUrl,
+        Options opt,
+        Logger? log = null,
+        TelemetryWriter? telemetry = null)
+    {
+        const int maxPromotedIntermediates = 32;
+
+        if (allFlat.Count == 0
+            || promotedIntermediateUrls.Count >= maxPromotedIntermediates
+            || allFlat.Count >= opt.MaxPagesPerSite)
+            return 0;
+
+        var knownUrls = allFlat
+            .Where(x => !string.IsNullOrWhiteSpace(x.Url))
+            .Select(x => x.Url)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var prefixGroups = new Dictionary<string, List<NavItem>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var item in allFlat)
+        {
+            if (string.IsNullOrWhiteSpace(item.Url)) continue;
+            if (item.Url.Equals(startUrl, StringComparison.OrdinalIgnoreCase)) continue;
+
+            var prefixUrl = GetImmediatePrefixUrl(item.Url);
+            if (string.IsNullOrWhiteSpace(prefixUrl)) continue;
+            if (prefixUrl.Equals(startUrl, StringComparison.OrdinalIgnoreCase)) continue;
+            if (knownUrls.Contains(prefixUrl)
+                || visited.Contains(prefixUrl)
+                || promotedIntermediateUrls.Contains(prefixUrl))
+                continue;
+
+            if (!prefixGroups.TryGetValue(prefixUrl, out var children))
+            {
+                children = new List<NavItem>();
+                prefixGroups[prefixUrl] = children;
+            }
+
+            if (!children.Any(x => x.Url.Equals(item.Url, StringComparison.OrdinalIgnoreCase)))
+                children.Add(item);
+        }
+
+        if (prefixGroups.Count == 0)
+            return 0;
+
+        var promotedItems = new List<QItem>();
+        foreach (var prefixUrl in prefixGroups.Keys
+            .OrderBy(CountUrlPathSegments)
+            .ThenBy(x => x, StringComparer.OrdinalIgnoreCase))
+        {
+            if (promotedIntermediateUrls.Count >= maxPromotedIntermediates)
+                break;
+            if (allFlat.Count + promotedItems.Count >= opt.MaxPagesPerSite)
+                break;
+            if (IsEventLikePromotionPrefix(prefixUrl))
+                continue;
+
+            var children = prefixGroups[prefixUrl];
+            var slug = GetLastPathSegment(prefixUrl);
+            var parentUrl = FindBestSyntheticParentUrl(prefixUrl, knownUrls, startUrl);
+            var decision = ScoreSyntheticParentCandidate(
+                prefixUrl,
+                slug,
+                children,
+                knownUrls,
+                allFlat,
+                startUrl,
+                parentUrl,
+                children.Count);
+
+            EmitDecision(log, telemetry, TelemetryPhase.Crawl, "MISSING_INTERMEDIATE_CANDIDATE", decision);
+
+            if (!decision.Accepted)
+                continue;
+
+            var parentDepth = allFlat
+                .Where(x => x.Url.Equals(parentUrl, StringComparison.OrdinalIgnoreCase))
+                .Select(x => x.Depth)
+                .DefaultIfEmpty(0)
+                .Min();
+            var depth = parentDepth + 1;
+            if (depth > opt.MaxDepth)
+                continue;
+
+            discovered.Add(prefixUrl);
+            promotedIntermediateUrls.Add(prefixUrl);
+            bestParentByUrl[prefixUrl] = parentUrl;
+            bestStructuralByUrl[prefixUrl] = true;
+            promotedItems.Add(new QItem(prefixUrl, depth, parentUrl, true, SlugToTitle(slug)));
+
+            log?.Event("MISSING_INTERMEDIATE_QUEUED",
+                ("url", prefixUrl),
+                ("parentUrl", parentUrl),
+                ("childCount", children.Count),
+                ("confidence", decision.Confidence.ToString("0.00")),
+                ("reason", "strong_missing_prefix_evidence"));
+
+            telemetry?.Emit(TelemetryPhase.Crawl, "MISSING_INTERMEDIATE_QUEUED", TelemetrySeverity.Info,
+                prefixUrl, DecisionFields(decision, new Dictionary<string, object?>
+                {
+                    ["parentUrl"] = parentUrl,
+                    ["childCount"] = children.Count
+                }));
+        }
+
+        var queued = promotedItems.Count;
+        if (queued > 0)
+        {
+            var existingItems = queue.ToList();
+            queue.Clear();
+            foreach (var item in promotedItems)
+                queue.Enqueue(item);
+            foreach (var item in existingItems)
+                queue.Enqueue(item);
+
+            log?.Event("MISSING_INTERMEDIATE_QUEUE_ROUND",
+                ("queued", queued),
+                ("totalPromoted", promotedIntermediateUrls.Count),
+                ("queueSize", queue.Count));
+        }
+
+        return queued;
+    }
+
+    private static bool IsEventLikePromotionPrefix(string url)
+    {
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var parsed))
+            return false;
+
+        return parsed.AbsolutePath
+            .Split('/', StringSplitOptions.RemoveEmptyEntries)
+            .Any(segment =>
+                segment.Equals("event", StringComparison.OrdinalIgnoreCase) ||
+                segment.Equals("events", StringComparison.OrdinalIgnoreCase) ||
+                segment.Contains("evenemang", StringComparison.OrdinalIgnoreCase) ||
+                segment.Contains("kalender", StringComparison.OrdinalIgnoreCase));
+    }
+
+    // Reparents descendants beneath promoted intermediates only when the promoted URL
+    // was visited successfully. This is intentionally narrower than general URL
+    // reconstruction and leaves failed promotion attempts to the synthetic fallback.
+    private static void ReparentItemsUnderPromotedIntermediatePages(
+        List<NavItem> allFlat,
+        List<NavItem> treeFlat,
+        HashSet<string> treeFlatEdges,
+        string startUrl,
+        HashSet<string> promotedIntermediateUrls,
+        HashSet<string> successfullyVisitedUrls,
+        Logger? log = null,
+        TelemetryWriter? telemetry = null)
+    {
+        var realPromotedUrls = promotedIntermediateUrls
+            .Where(successfullyVisitedUrls.Contains)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        if (realPromotedUrls.Count == 0)
+            return;
+
+        var allFlatByUrl = new Dictionary<string, NavItem>(StringComparer.OrdinalIgnoreCase);
+        foreach (var item in allFlat)
+        {
+            if (!string.IsNullOrWhiteSpace(item.Url) && !allFlatByUrl.ContainsKey(item.Url))
+                allFlatByUrl[item.Url] = item;
+        }
+
+        var treeFlatByUrl = new Dictionary<string, NavItem>(StringComparer.OrdinalIgnoreCase);
+        foreach (var item in treeFlat)
+        {
+            if (!string.IsNullOrWhiteSpace(item.Url) && !treeFlatByUrl.ContainsKey(item.Url))
+                treeFlatByUrl[item.Url] = item;
+        }
+
+        var reparents = 0;
+        foreach (var item in allFlat
+            .Where(x => !string.IsNullOrWhiteSpace(x.Url))
+            .OrderBy(x => CountUrlPathSegments(x.Url))
+            .ToList())
+        {
+            if (item.Url.Equals(startUrl, StringComparison.OrdinalIgnoreCase)) continue;
+            if (realPromotedUrls.Contains(item.Url)) continue;
+
+            var bestParentUrl = realPromotedUrls
+                .Where(parentUrl => IsUrlDescendantOf(parentUrl, item.Url))
+                .OrderByDescending(CountUrlPathSegments)
+                .FirstOrDefault();
+
+            if (string.IsNullOrWhiteSpace(bestParentUrl)) continue;
+            if (item.ParentUrl.Equals(bestParentUrl, StringComparison.OrdinalIgnoreCase)) continue;
+            if (!allFlatByUrl.TryGetValue(bestParentUrl, out var parent)) continue;
+            if (CountUrlPathSegments(bestParentUrl) <= CountUrlPathSegments(item.ParentUrl)) continue;
+
+            var oldParentUrl = item.ParentUrl;
+            item.ParentUrl = bestParentUrl;
+            item.Depth = parent.Depth + 1;
+
+            if (treeFlatByUrl.TryGetValue(item.Url, out var treeItem))
+            {
+                treeItem.ParentUrl = bestParentUrl;
+                treeItem.Depth = parent.Depth + 1;
+            }
+
+            var edgeKey = $"{bestParentUrl}|{item.Url}";
+            if (treeFlatEdges.Add(edgeKey) && !treeFlatByUrl.ContainsKey(item.Url))
+            {
+                var newTreeItem = new NavItem
+                {
+                    Url = item.Url,
+                    Title = item.Title,
+                    ParentUrl = bestParentUrl,
+                    Depth = parent.Depth + 1
+                };
+                treeFlat.Add(newTreeItem);
+                treeFlatByUrl[item.Url] = newTreeItem;
+            }
+
+            log?.Event("PROMOTED_INTERMEDIATE_PARENT_APPLIED",
+                ("url", item.Url),
+                ("oldParentUrl", oldParentUrl),
+                ("parentUrl", bestParentUrl));
+
+            telemetry?.Emit(TelemetryPhase.TreeBuilding, "PROMOTED_INTERMEDIATE_PARENT_APPLIED",
+                TelemetrySeverity.Info, item.Url, new Dictionary<string, object?>
+                {
+                    ["oldParentUrl"] = oldParentUrl,
+                    ["parentUrl"] = bestParentUrl
+                });
+
+            reparents++;
+        }
+
+        log?.Event("PROMOTED_INTERMEDIATE_REPARENT_SUMMARY",
+            ("promotedVisited", realPromotedUrls.Count),
+            ("reparented", reparents));
     }
 
     // Synthetic URL-prefix parent pass.
