@@ -121,6 +121,9 @@ diagnostics*/
 /output*/
 output*/
 overnight*/
+/.diagnostics*/
+/.output*/
+/.pattern_b_visual_validation/
 /overnight_batch*/
 /overnight_batch_sitevision*/
 /archive_inventory/
@@ -455,6 +458,8 @@ sites_precaution_run.txt
 sites_root_purity_klippan_validate.txt
 sites_topology_validate.txt
 sites_root_purity_validate.txt
+/sites_eslov*.txt
+/sites_full_batch*.txt
 _audit_screenshot.csx
 _audit_tool/audit_tool.csproj
 .tmp_*

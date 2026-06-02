@@ -472,7 +472,11 @@ async () => {
         seen.add(abs);
         results.push({
           url: abs,
-          text: it.displayName || it.uri,
+          text: it.displayName || (() => {
+            const seg = (it.uri || '').split('/').filter(Boolean).pop() || '';
+            const clean = seg.replace(/\.\d+\.html?$/i, '').replace(/-/g, ' ').trim();
+            return clean || it.uri || '';
+          })(),
           kind: 'treemenu',
           sourceType: 'TreeMenu',
           displayRole: 'Navigation',

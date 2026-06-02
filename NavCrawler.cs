@@ -808,18 +808,22 @@ public sealed class NavCrawler
                         var currentBestParent = bestParentByUrl.TryGetValue(child, out var bp) ? bp : startAbs;
                         var currentBestStructural = bestStructuralByUrl.TryGetValue(child, out var bs) && bs;
 
+                        allFlatByUrl.TryGetValue(child, out var canonicalItem);
+                        allFlatByUrl.TryGetValue(currentBestParent, out var currentParentItem);
+                        allFlatByUrl.TryGetValue(parentForChild, out var newParentItem);
+
                         if (ShouldUpgradeParent(
                             childUrl: child,
                             currentParentUrl: currentBestParent,
                             newParentUrl: parentForChild,
                             currentIsStructural: currentBestStructural,
                             newIsStructural: childStructural,
-                            startUrl: startAbs))
+                            startUrl: startAbs,
+                            out var upgradeReason))
                         {
                             bestParentByUrl[child] = parentForChild;
                             bestStructuralByUrl[child] = childStructural || currentBestStructural;
 
-                            allFlatByUrl.TryGetValue(child, out var canonicalItem);
                             var childTitle = canonicalItem?.Title ?? child;
                             var childDepth = canonicalItem?.Depth ?? 0;
 
@@ -855,6 +859,35 @@ public sealed class NavCrawler
                                 ("oldParent", currentBestParent),
                                 ("newParent", parentForChild),
                                 ("structural", childStructural));
+
+                            _telemetry?.Emit(TelemetryPhase.Crawl, "PARENT_UPGRADE_ACCEPTED",
+                                TelemetrySeverity.Info, child, new Dictionary<string, object?>
+                                {
+                                    ["childUrl"]       = child,
+                                    ["oldParentUrl"]   = currentBestParent,
+                                    ["newParentUrl"]   = parentForChild,
+                                    ["reason"]         = upgradeReason,
+                                    ["oldParentDepth"] = currentParentItem?.Depth ?? 0,
+                                    ["newParentDepth"] = newParentItem?.Depth ?? 0,
+                                    ["childDepth"]     = childDepth
+                                });
+                        }
+                        else if (upgradeReason is "child_url_under_more_specific_parent"
+                                               or "new_more_specific_but_child_not_under_it"
+                                               or "new_is_shallower_ancestor"
+                                               or "unrelated_urls")
+                        {
+                            _telemetry?.Emit(TelemetryPhase.Crawl, "PARENT_UPGRADE_REJECTED",
+                                TelemetrySeverity.Debug, child, new Dictionary<string, object?>
+                                {
+                                    ["childUrl"]       = child,
+                                    ["oldParentUrl"]   = currentBestParent,
+                                    ["newParentUrl"]   = parentForChild,
+                                    ["reason"]         = upgradeReason,
+                                    ["oldParentDepth"] = currentParentItem?.Depth ?? 0,
+                                    ["newParentDepth"] = newParentItem?.Depth ?? 0,
+                                    ["childDepth"]     = canonicalItem?.Depth ?? 0
+                                });
                         }
                     }
                 }
@@ -891,6 +924,11 @@ public sealed class NavCrawler
         // crawl.  We create a synthetic placeholder node for each such missing prefix so the
         // archive viewer groups them rather than dumping hundreds of leaf pages at root.
         InsertSyntheticPrefixParents(allFlat, treeFlat, treeFlatEdges, startAbs, homepageSections, _log, _telemetry);
+
+        // Synthetic intermediate parent pass — section-root level.
+        // Handles the case where items are parented to a depth-1 section root but their
+        // URL path reveals a missing intermediate layer (WordPress/Municipio primary case).
+        InsertSyntheticPrefixParentsUnderAnchorPages(allFlat, treeFlat, treeFlatEdges, startAbs, _log, _telemetry);
 
         allFlat = FinalizeFlatNavigation(allFlat, startAbs, _log);
         treeFlat = FinalizeTreeFlat(treeFlat, allFlat, _log);
@@ -1035,7 +1073,25 @@ public sealed class NavCrawler
     private static async Task<string> SafeTitleAsync(IPage page, CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
-        try { return (await page.TitleAsync() ?? "").Trim(); }
+        try
+        {
+            var t = (await page.TitleAsync() ?? "").Trim();
+            // When title is absent or is a raw SiteVision filename (word.nnnn.html), fall back to
+            // the page H1 which reliably carries the correct Swedish display name.
+            if (string.IsNullOrEmpty(t) || IsRawUrlLikeTitle(t, null))
+            {
+                try
+                {
+                    var h1 = await page.EvaluateAsync<string>(
+                        "() => { const h = document.querySelector('main h1, article h1, h1'); " +
+                        "return h ? h.innerText.replace(/\\s+/g, ' ').trim() : ''; }");
+                    if (!string.IsNullOrWhiteSpace(h1))
+                        return h1.Trim();
+                }
+                catch { }
+            }
+            return t;
+        }
         catch { return ""; }
     }
 
@@ -1453,27 +1509,57 @@ public sealed class NavCrawler
         string newParentUrl,
         bool currentIsStructural,
         bool newIsStructural,
-        string startUrl)
+        string startUrl,
+        out string reason)
     {
         if (string.IsNullOrWhiteSpace(newParentUrl))
+        {
+            reason = "new_parent_null";
             return false;
+        }
 
         if (string.Equals(currentParentUrl, newParentUrl, StringComparison.OrdinalIgnoreCase))
+        {
+            reason = "same_parent";
             return false;
+        }
 
         if (newIsStructural && !currentIsStructural)
+        {
+            reason = "new_is_structural";
             return true;
+        }
 
         if (string.IsNullOrWhiteSpace(currentParentUrl) ||
             string.Equals(currentParentUrl, startUrl, StringComparison.OrdinalIgnoreCase))
-            return !string.Equals(newParentUrl, startUrl, StringComparison.OrdinalIgnoreCase);
+        {
+            var upgrade = !string.Equals(newParentUrl, startUrl, StringComparison.OrdinalIgnoreCase);
+            reason = upgrade ? "current_is_root" : "new_is_also_root";
+            return upgrade;
+        }
 
         if (IsUrlDescendantOf(currentParentUrl, newParentUrl))
+        {
+            // newParentUrl is URL-path more specific than currentParentUrl.
+            // Only upgrade when the child also lives under the new parent by URL topology —
+            // this prevents cross-section stealing (e.g. /grundskola claiming a child
+            // that actually lives under /vuxenutbildning).
+            if (IsUrlDescendantOf(newParentUrl, childUrl))
+            {
+                reason = "child_url_under_more_specific_parent";
+                return true;
+            }
+            reason = "new_more_specific_but_child_not_under_it";
             return false;
+        }
 
         if (IsUrlDescendantOf(newParentUrl, currentParentUrl))
+        {
+            reason = "new_is_shallower_ancestor";
             return true;
+        }
 
+        reason = "unrelated_urls";
         return false;
     }
 
@@ -1736,6 +1822,211 @@ public sealed class NavCrawler
             ("syntheticParentsCreated", syntheticCount));
     }
 
+    // Synthetic intermediate parent pass — section-root level.
+    //
+    // InsertSyntheticPrefixParents handles deep items that are direct children of startUrl.
+    // This pass handles the complementary case: items that are direct children of a depth-1
+    // section root but whose URL paths reveal a missing intermediate layer.
+    //
+    // Primary case — WordPress/Municipio: the WP REST nav seed and the section-root structural
+    // nav both omit sub-section pages (e.g. /utbildning-barnomsorg/grundskola), so those
+    // intermediate pages are never queued, never crawled, and never appear as nav nodes.
+    // Children discovered under them land on the section root instead.
+    //
+    // Safety conditions (same rules as InsertSyntheticPrefixParents):
+    //   - Missing prefix must have ≥ 2 children sharing it.
+    //   - Prefix slug must not be numeric/dated/article/event/utility.
+    //   - Prefix must not already exist in allFlat.
+    //   - No cycles created.
+    private static void InsertSyntheticPrefixParentsUnderAnchorPages(
+        List<NavItem> allFlat,
+        List<NavItem> treeFlat,
+        HashSet<string> treeFlatEdges,
+        string startUrl,
+        Logger? log = null,
+        TelemetryWriter? telemetry = null)
+    {
+        // Build known-URL index (includes synthetic nodes from the root-level pass).
+        var knownUrls = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var allFlatByUrl = new Dictionary<string, NavItem>(StringComparer.OrdinalIgnoreCase);
+        foreach (var it in allFlat)
+        {
+            if (string.IsNullOrWhiteSpace(it.Url)) continue;
+            knownUrls.Add(it.Url);
+            if (!allFlatByUrl.ContainsKey(it.Url))
+                allFlatByUrl[it.Url] = it;
+        }
+
+        var treeFlatByUrl = new Dictionary<string, NavItem>(StringComparer.OrdinalIgnoreCase);
+        foreach (var it in treeFlat)
+            if (!string.IsNullOrWhiteSpace(it.Url) && !treeFlatByUrl.ContainsKey(it.Url))
+                treeFlatByUrl[it.Url] = it;
+
+        // Depth-1 structural pages (direct children of startUrl) are the anchor pages.
+        var sectionRootUrls = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var it in allFlat)
+        {
+            if (string.IsNullOrWhiteSpace(it.Url)) continue;
+            if (it.Url.Equals(startUrl, StringComparison.OrdinalIgnoreCase)) continue;
+            if (it.ParentUrl.Equals(startUrl, StringComparison.OrdinalIgnoreCase))
+                sectionRootUrls.Add(it.Url);
+        }
+
+        if (sectionRootUrls.Count == 0)
+            return;
+
+        // Find candidates: items parented to a section root whose immediate URL prefix
+        // is not the section root itself and is not already in allFlat.
+        var prefixGroups = new Dictionary<string, List<NavItem>>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var it in allFlat)
+        {
+            if (string.IsNullOrWhiteSpace(it.Url)) continue;
+            if (it.Url.Equals(startUrl, StringComparison.OrdinalIgnoreCase)) continue;
+            if (!sectionRootUrls.Contains(it.ParentUrl)) continue;
+
+            var immPrefix = GetImmediatePrefixUrl(it.Url);
+            if (immPrefix == null) continue;
+            // No gap: immediate URL parent equals the registered parent.
+            if (immPrefix.Equals(it.ParentUrl, StringComparison.OrdinalIgnoreCase)) continue;
+            // Intermediate already exists — no synthesis needed.
+            if (knownUrls.Contains(immPrefix)) continue;
+
+            if (!prefixGroups.TryGetValue(immPrefix, out var group))
+            {
+                group = new List<NavItem>();
+                prefixGroups[immPrefix] = group;
+            }
+            group.Add(it);
+        }
+
+        if (prefixGroups.Count == 0)
+            return;
+
+        var deepSectionChildBefore = prefixGroups.Values.Sum(g => g.Count);
+
+        log?.Event("SECTION_SYNTHETIC_PARENT_PASS_START",
+            ("anchorPageCount",    sectionRootUrls.Count),
+            ("candidateGroupCount", prefixGroups.Count),
+            ("candidateChildCount", deepSectionChildBefore));
+
+        // Process shallowest prefixes first so chained missing parents resolve correctly.
+        var sortedPrefixes = prefixGroups.Keys
+            .OrderBy(CountUrlPathSegments)
+            .ToList();
+
+        var syntheticCount = 0;
+
+        foreach (var prefixUrl in sortedPrefixes)
+        {
+            var children = prefixGroups[prefixUrl];
+            var slug = GetLastPathSegment(prefixUrl);
+            var syntheticParentUrl = FindBestSyntheticParentUrl(prefixUrl, knownUrls, startUrl);
+            var decision = ScoreSyntheticParentCandidate(
+                prefixUrl,
+                slug,
+                children,
+                knownUrls,
+                allFlat,
+                startUrl,
+                syntheticParentUrl,
+                deepSectionChildBefore);
+
+            EmitDecision(log, telemetry, TelemetryPhase.TreeBuilding, "SYNTHETIC_PARENT_CANDIDATE", decision);
+
+            if (!decision.Accepted)
+            {
+                EmitDecision(log, telemetry, TelemetryPhase.TreeBuilding, "SYNTHETIC_PARENT_REJECTED", decision);
+                continue;
+            }
+
+            var title = SlugToTitle(slug);
+            var syntheticDepth = allFlatByUrl.TryGetValue(syntheticParentUrl, out var parentItem)
+                ? parentItem.Depth + 1
+                : 1;
+
+            var syntheticNode = new NavItem
+            {
+                Url         = prefixUrl,
+                Title       = title,
+                ParentUrl   = syntheticParentUrl,
+                Depth       = syntheticDepth,
+                IsSynthetic = true
+            };
+
+            allFlat.Add(syntheticNode);
+            allFlatByUrl[prefixUrl] = syntheticNode;
+            knownUrls.Add(prefixUrl);
+
+            if (!treeFlatByUrl.ContainsKey(prefixUrl))
+            {
+                var treeNode = new NavItem
+                {
+                    Url         = prefixUrl,
+                    Title       = title,
+                    ParentUrl   = syntheticParentUrl,
+                    Depth       = syntheticDepth,
+                    IsSynthetic = true
+                };
+                treeFlat.Add(treeNode);
+                treeFlatByUrl[prefixUrl] = treeNode;
+                treeFlatEdges.Add($"{syntheticParentUrl}|{prefixUrl}");
+            }
+
+            foreach (var child in children)
+            {
+                child.ParentUrl = prefixUrl;
+                child.Depth     = syntheticDepth + 1;
+
+                if (treeFlatByUrl.TryGetValue(child.Url, out var treeChild))
+                {
+                    treeChild.ParentUrl = prefixUrl;
+                    treeChild.Depth     = syntheticDepth + 1;
+                }
+
+                var childEdgeKey = $"{prefixUrl}|{child.Url}";
+                if (treeFlatEdges.Add(childEdgeKey) && !treeFlatByUrl.ContainsKey(child.Url))
+                {
+                    var newTreeChild = new NavItem
+                    {
+                        Url       = child.Url,
+                        Title     = child.Title,
+                        ParentUrl = prefixUrl,
+                        Depth     = syntheticDepth + 1
+                    };
+                    treeFlat.Add(newTreeChild);
+                    treeFlatByUrl[child.Url] = newTreeChild;
+                }
+            }
+
+            log?.Event("SYNTHETIC_PARENT_CREATED",
+                ("url",              prefixUrl),
+                ("title",            title),
+                ("childCount",       children.Count),
+                ("parentUrl",        syntheticParentUrl),
+                ("confidence",       decision.Confidence.ToString("0.00")),
+                ("positiveEvidence", string.Join("|", decision.PositiveEvidence)),
+                ("negativeEvidence", string.Join("|", decision.NegativeEvidence)),
+                ("reason",           "synthetic_section_prefix_parent"));
+
+            telemetry?.Emit(TelemetryPhase.TreeBuilding, "SYNTHETIC_PARENT_CREATED", TelemetrySeverity.Info,
+                prefixUrl, DecisionFields(decision, new Dictionary<string, object?>
+                {
+                    ["parentUrl"]  = syntheticParentUrl,
+                    ["childCount"] = children.Count
+                }));
+
+            syntheticCount++;
+        }
+
+        if (syntheticCount > 0)
+        {
+            log?.Event("SECTION_LEAF_POLLUTION_REDUCED",
+                ("syntheticParentsCreated", syntheticCount),
+                ("deepSectionChildBefore",  deepSectionChildBefore));
+        }
+    }
+
     // Returns the URL one path segment shorter than the given URL.
     // e.g. https://www.eslov.se/fritidsaktiviteter/eslovs-tennisklubb
     //   => https://www.eslov.se/fritidsaktiviteter
@@ -1922,13 +2213,20 @@ public sealed class NavCrawler
             }
 
             // -- Strategy 2: URL-path lookup in allFlatByUrl (WordPress clean-slug URLs) --
-            // Used when Strategy 1 found no ancestor (e.g. intermediate section page is in
-            // allFlat but not in treeFlat, or was reparented and is no longer at depth 1).
-            if (bestParent == null)
+            // Always runs. When Strategy 1 found a depth-1 section root but a deeper
+            // intermediate page is already in allFlat (e.g. was BFS-crawled), Strategy 2
+            // finds it and overrides Strategy 1's shallower result.
             {
-                var ancestorUrl = FindNearestKnownAncestorUrl(item.Url, allFlatByUrl, startUrl);
-                if (ancestorUrl != null)
-                    bestParent = allFlatByUrl[ancestorUrl];
+                var s2Url = FindNearestKnownAncestorUrl(item.Url, allFlatByUrl, startUrl);
+                if (s2Url != null)
+                {
+                    var s2Candidate = allFlatByUrl[s2Url];
+                    if (bestParent == null ||
+                        CountUrlPathSegments(s2Candidate.Url) > CountUrlPathSegments(bestParent.Url))
+                    {
+                        bestParent = s2Candidate;
+                    }
+                }
             }
 
             var isStructuralParent = bestParent != null && sectionPages.Contains(bestParent);
@@ -2850,6 +3148,10 @@ public sealed class NavCrawler
         if (t.StartsWith("http://", StringComparison.OrdinalIgnoreCase)) return true;
         if (t.StartsWith("https://", StringComparison.OrdinalIgnoreCase)) return true;
         if (t.StartsWith("/", StringComparison.Ordinal)) return true;
+        // SiteVision uses the filename as page title when displayName is absent (e.g. "Lovochlasar.2238.html")
+        if (System.Text.RegularExpressions.Regex.IsMatch(t, @"^[a-z0-9]+\.\d{3,}\.html?$",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+            return true;
         if (Uri.TryCreate(url, UriKind.Absolute, out var u))
         {
             var host = u.Host.Trim();
@@ -2869,7 +3171,13 @@ public sealed class NavCrawler
         {
             var segments = u.AbsolutePath.TrimEnd('/').Split('/', StringSplitOptions.RemoveEmptyEntries);
             if (segments.Length > 0)
-                return SlugToTitle(segments[^1]);
+            {
+                var seg = segments[^1];
+                // Strip SiteVision numeric-ID suffix (.nnnn.html) before slug conversion
+                seg = System.Text.RegularExpressions.Regex.Replace(seg, @"\.\d{3,}\.html?$", "",
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                return SlugToTitle(seg);
+            }
             return Utils.HostToMunicipality(u.Host);
         }
 
