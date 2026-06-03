@@ -306,6 +306,14 @@ public static class MunicipalRootClassifier
 
     private static bool IsNewsEventOrServiceRoot(string url, string title)
     {
+        // CMS-generated category/archive pages carry a title prefix such as "Arkiv: " (Swedish
+        // WordPress) or "Archive: " (English WordPress/other CMS). These pages are auto-generated
+        // and are not municipality-authored IA sections regardless of what their URL contains.
+        var titleNorm = NormalizeText(title ?? "");
+        if (titleNorm.StartsWith("arkiv:", StringComparison.OrdinalIgnoreCase) ||
+            titleNorm.StartsWith("archive:", StringComparison.OrdinalIgnoreCase))
+            return true;
+
         var text = NormalizeText(title + " " + NormalizedPathText(url));
         var segments = PathSegments(url).Select(NormalizeText).ToArray();
         var first = segments.FirstOrDefault() ?? "";

@@ -102,7 +102,7 @@ public sealed class SiteViewerBuilder
 
     private static string GetDisplayTitle(string? title, string? url)
     {
-        var t = (title ?? "").Trim();
+        var t = StripCmsArchivePrefix((title ?? "").Trim());
         if (t.Length > 0
             && !t.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
             && !t.StartsWith("https://", StringComparison.OrdinalIgnoreCase)
@@ -110,6 +110,18 @@ public sealed class SiteViewerBuilder
             return t;
 
         return HumanizeUrlSlug(url ?? "");
+    }
+
+    // Strips the CMS-generated archive/category prefix ("Arkiv: " / "Archive: ") from a title
+    // so that e.g. "Arkiv: Navetinsatser" is displayed as "Navetinsatser" in the viewer.
+    // Only the exact colon-space pattern is stripped; the word alone (e.g. "Arkiv") is left alone.
+    private static string StripCmsArchivePrefix(string title)
+    {
+        if (title.StartsWith("Arkiv: ", StringComparison.OrdinalIgnoreCase))
+            return title[7..].TrimStart();
+        if (title.StartsWith("Archive: ", StringComparison.OrdinalIgnoreCase))
+            return title[9..].TrimStart();
+        return title;
     }
 
     private static string DisplayTitleResolutionReason(string? title, string? url, string resolved)
@@ -415,6 +427,11 @@ public sealed class SiteViewerBuilder
 
         var structuralRootUrlsLower = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
+        // Maps lowercased root URL → MunicipalRootClassificationKind name for every demoted
+        // (non-structural, non-utility) root child. Used by the viewer JS to sub-group
+        // the Övrigt innehåll section into Nyheter / Aktuellt / Övrigt.
+        var discoveredKindMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
         var flatByUrlLower = flat
             .Where(x => !string.IsNullOrWhiteSpace(x.Url))
             .GroupBy(x => Utils.NormalizeUrl(x.Url, dropQueryStrings).ToLowerInvariant(), StringComparer.OrdinalIgnoreCase)
@@ -474,7 +491,10 @@ public sealed class SiteViewerBuilder
                     if (decision.Kind == MunicipalRootClassificationKind.UtilityRoot)
                         utilityUrlsLower.Add(key);
                     else
+                    {
                         item.MunicipalRootClassification = decision.KindName;
+                        discoveredKindMap[key] = decision.KindName;
+                    }
 
                     log?.Event("MUNICIPAL_ROOT_DEMOTED",
                         ("title", child.Title),
@@ -533,9 +553,10 @@ public sealed class SiteViewerBuilder
             .ToList();
 
         var structuralRootUrlsJson = JsonSerializer.Serialize(structuralRootUrlsLower.ToArray());
-        var utilityUrlsJson      = JsonSerializer.Serialize(utilityUrlsLower.ToArray());
-        var discoveredUrlsJson   = JsonSerializer.Serialize(discoveredUrlsLower.ToArray());
-        var homepageSectionsJson = JsonSerializer.Serialize(homepageSectionsJs);
+        var utilityUrlsJson        = JsonSerializer.Serialize(utilityUrlsLower.ToArray());
+        var discoveredUrlsJson     = JsonSerializer.Serialize(discoveredUrlsLower.ToArray());
+        var discoveredKindMapJson  = JsonSerializer.Serialize(discoveredKindMap);
+        var homepageSectionsJson   = JsonSerializer.Serialize(homepageSectionsJs);
 
         var sb = new StringBuilder();
 
@@ -604,6 +625,8 @@ public sealed class SiteViewerBuilder
         sb.AppendLine("    main{flex:1;background:#f5f5f5;display:flex;flex-direction:column;}");
         sb.AppendLine("    iframe{flex:1;width:100%;border:0;background:#f5f5f5;min-height:0;}");
         sb.AppendLine("    .text-only-banner{background:#5c3100;color:#ffd06f;padding:8px 14px;font-size:.84rem;flex:0 0 auto;border-bottom:1px solid rgba(0,0,0,.25);}");
+        sb.AppendLine("    .discSubLabel{padding:5px 12px 3px;color:rgba(255,255,255,.4);font-size:.71rem;font-weight:700;text-transform:uppercase;letter-spacing:.05em;border-top:1px solid rgba(255,255,255,.07);margin-top:3px;}");
+        sb.AppendLine("    .discSubLabel:first-child{border-top:0;margin-top:0;}");
         sb.AppendLine("  </style>");
         sb.AppendLine("</head>");
         sb.AppendLine("<body>");
@@ -648,6 +671,7 @@ public sealed class SiteViewerBuilder
         sb.Append("      const structuralRootUrls = new Set(").Append(structuralRootUrlsJson).AppendLine(");");
         sb.Append("      const utilityUrls = new Set(").Append(utilityUrlsJson).AppendLine(");");
         sb.Append("      const discoveredUrls = new Set(").Append(discoveredUrlsJson).AppendLine(");");
+        sb.Append("      const discoveredKindMap = ").Append(discoveredKindMapJson).AppendLine(";");
         sb.Append("      const homepageSections = ").Append(homepageSectionsJson).AppendLine(";");
         sb.AppendLine("      const navPane = document.getElementById('navPane');");
         sb.AppendLine("      const iframe = document.getElementById('view');");
@@ -792,18 +816,45 @@ public sealed class SiteViewerBuilder
         sb.AppendLine("            html += '</div>';");
         sb.AppendLine("          }");
 
-        // Discovered content section (Phase 8 — collapsed by default unless searching)
-        sb.AppendLine("          const dParts = discovered.map(n => buildTreeNode(n, 0, filter, 'tree-link')).filter(x => x.visible);");
-        sb.AppendLine("          if (dParts.length) {");
+        // Discovered content section — sub-grouped into Nyheter / Aktuellt / Övrigt.
+        // Sub-routing uses the URL first path segment only (CMS-independent).
+        // discoveredKindMap is available in JS for data but not used for routing.
+        sb.AppendLine("          if (discovered.length) {");
         sb.AppendLine("            const dOpen = !!f;");
-        sb.AppendLine("            html += '<button class=\"sectionToggle\" data-target=\"discBody\" type=\"button\">';");
-        sb.AppendLine("            html += '<span class=\"sectionArrow\">' + (dOpen ? '\\u25BE' : '\\u25B8') + '</span>';");
-        sb.AppendLine("            html += ' \\u00D6vrigt inneh\\u00E5ll';");
-        sb.AppendLine("            html += '<span class=\"sectionCount\">(' + discovered.length + ')</span>';");
-        sb.AppendLine("            html += '</button>';");
-        sb.AppendLine("            html += '<div id=\"discBody\" class=\"sectionBody sectionBody--disc' + (dOpen ? '' : ' sectionBody--hidden') + '\">';");
-        sb.AppendLine("            html += '<div class=\"tree\"><ul class=\"tree-root\">' + dParts.map(x => x.html).join('') + '</ul></div>';");
-        sb.AppendLine("            html += '</div>';");
+        sb.AppendLine("            function discSub(kid) {");
+        sb.AppendLine("              const seg = normUrl(kid.url || '').replace(/.*?:\\/\\/[^/]+\\//, '').split('/')[0];");
+        sb.AppendLine("              if (/^(nyheter|nyhet|news|pressmeddelanden?)/.test(seg)) return 'news';");
+        sb.AppendLine("              if (/^(event|evenemang|kalender|anslag|lediga|jobb|aktuellt|kampanj|drift)/.test(seg)) return 'current';");
+        sb.AppendLine("              return 'other';");
+        sb.AppendLine("            }");
+        sb.AppendLine("            const discNews    = discovered.filter(n => discSub(n) === 'news');");
+        sb.AppendLine("            const discCurrent = discovered.filter(n => discSub(n) === 'current');");
+        sb.AppendLine("            const discOther   = discovered.filter(n => discSub(n) === 'other');");
+        sb.AppendLine("            const dnParts = discNews.map(n    => buildTreeNode(n, 0, filter, 'tree-link')).filter(x => x.visible);");
+        sb.AppendLine("            const dcParts = discCurrent.map(n => buildTreeNode(n, 0, filter, 'tree-link')).filter(x => x.visible);");
+        sb.AppendLine("            const doParts = discOther.map(n   => buildTreeNode(n, 0, filter, 'tree-link')).filter(x => x.visible);");
+        sb.AppendLine("            const anyDisc = dnParts.length || dcParts.length || doParts.length;");
+        sb.AppendLine("            if (anyDisc) {");
+        sb.AppendLine("              html += '<button class=\"sectionToggle\" data-target=\"discBody\" type=\"button\">';");
+        sb.AppendLine("              html += '<span class=\"sectionArrow\">' + (dOpen ? '\\u25BE' : '\\u25B8') + '</span>';");
+        sb.AppendLine("              html += ' \\u00D6vrigt inneh\\u00E5ll';");
+        sb.AppendLine("              html += '<span class=\"sectionCount\">(' + discovered.length + ')</span>';");
+        sb.AppendLine("              html += '</button>';");
+        sb.AppendLine("              html += '<div id=\"discBody\" class=\"sectionBody sectionBody--disc' + (dOpen ? '' : ' sectionBody--hidden') + '\">';");
+        sb.AppendLine("              if (dnParts.length) {");
+        sb.AppendLine("                html += '<div class=\"discSubLabel\">Nyheter</div>';");
+        sb.AppendLine("                html += '<div class=\"tree\"><ul class=\"tree-root\">' + dnParts.map(x => x.html).join('') + '</ul></div>';");
+        sb.AppendLine("              }");
+        sb.AppendLine("              if (dcParts.length) {");
+        sb.AppendLine("                html += '<div class=\"discSubLabel\">Aktuellt</div>';");
+        sb.AppendLine("                html += '<div class=\"tree\"><ul class=\"tree-root\">' + dcParts.map(x => x.html).join('') + '</ul></div>';");
+        sb.AppendLine("              }");
+        sb.AppendLine("              if (doParts.length) {");
+        sb.AppendLine("                html += '<div class=\"discSubLabel\">\\u00D6vrigt</div>';");
+        sb.AppendLine("                html += '<div class=\"tree\"><ul class=\"tree-root\">' + doParts.map(x => x.html).join('') + '</ul></div>';");
+        sb.AppendLine("              }");
+        sb.AppendLine("              html += '</div>';");
+        sb.AppendLine("            }");
         sb.AppendLine("          }");
 
         sb.AppendLine("        } else {");

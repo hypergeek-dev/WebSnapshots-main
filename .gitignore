@@ -476,3 +476,4 @@ sites_root_purity_validate.txt
 _audit_screenshot.csx
 _audit_tool/audit_tool.csproj
 .tmp_*
+VIEWER_CLASSIFICATION_INVESTIGATION.md
