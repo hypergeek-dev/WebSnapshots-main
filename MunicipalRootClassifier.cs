@@ -164,7 +164,31 @@ public static class MunicipalRootClassifier
             "tillganglighetsredogorelse"
         };
 
-        return utilityTokens.Any(t => text.Contains(t, StringComparison.OrdinalIgnoreCase));
+        if (utilityTokens.Any(t => text.Contains(t, StringComparison.OrdinalIgnoreCase)))
+            return true;
+
+        // First-segment checks for SiteVision utility paths not caught by the token list.
+        // Using first-segment exact match avoids false positives on legitimate section names
+        // like /nyheter-och-kommunikation or /svenska-for-invandrare.
+        var rawSegs = PathSegments(url);
+        if (rawSegs.Length >= 1)
+        {
+            var firstNorm = NormalizeText(rawSegs[0]);
+
+            // Search pages, language switchers, SiteVision toolbox, editorial archive roots
+            if (firstNorm is "sok" or "soka" or "finska" or "engelska"
+                            or "verktygsmeny" or "nyheter" or "evenemang")
+                return true;
+
+            // SiteVision "Om [municipality].se" single-segment site-meta pages
+            // (e.g. /om-bjuv.se.html, /om-bjuv.se) — contains a period in the raw segment
+            if (rawSegs.Length == 1
+                && rawSegs[0].StartsWith("om-", StringComparison.OrdinalIgnoreCase)
+                && rawSegs[0].Contains('.'))
+                return true;
+        }
+
+        return false;
     }
 
     public static bool IsLikelyMunicipalSection(string url, string title = "")

@@ -3902,7 +3902,7 @@ DrainNavigationQueue:
                 ("candidates", raw.Length),
                 ("accepted", accepted),
                 ("rejected", rejected),
-                ("threshold", "0.68"));
+                ("threshold", "0.62"));
 
             _telemetry?.Emit(TelemetryPhase.NavStartExtraction, "HOMEPAGE_ANCHOR_GROUP_SUMMARY",
                 TelemetrySeverity.Info, startUrl, new Dictionary<string, object?>
@@ -3910,7 +3910,7 @@ DrainNavigationQueue:
                     ["candidates"] = raw.Length,
                     ["accepted"] = accepted,
                     ["rejected"] = rejected,
-                    ["threshold"] = 0.68
+                    ["threshold"] = 0.62
                 });
 
             return classification;
@@ -3948,7 +3948,7 @@ DrainNavigationQueue:
     // these pages from the municipality's primary IA sections.
     private static NavigationDecisionEvidence ScoreHomepageAnchorCandidate(HomepageSectionJs r, string normalizedUrl)
     {
-        const double threshold = 0.68;
+        const double threshold = 0.62;
         var d = new NavigationDecisionEvidence
         {
             DecisionType = "homepage_structural_anchor",
