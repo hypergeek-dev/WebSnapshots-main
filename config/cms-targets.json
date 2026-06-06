@@ -71,6 +71,13 @@
       "purpose": "Swedish public-sector Drupal crawl"
     },
     {
+      "id": "sitevision_simrishamn",
+      "name": "Simrishamns kommun",
+      "cms": "SiteVision",
+      "url": "https://www.simrishamn.se/",
+      "purpose": "SiteVision ws-theme validation target — pushbar drawer navigation"
+    },
+    {
       "id": "acos_namsos",
       "name": "Namsos kommune",
       "cms": "Unknown",

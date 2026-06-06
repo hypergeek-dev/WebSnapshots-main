@@ -54,13 +54,31 @@ public sealed class CmsAwareNavExtractor
 
         if (_cms.Kind == CmsKind.SiteVision)
         {
+            var wsThemeNav = await ExtractSiteVisionWsThemeNavAsync(page, pageUrl, host, dropQueryStrings, maxLinks);
+            if (wsThemeNav.Count > 0)
+            {
+                groups.Add(new NavGroup
+                {
+                    Id = "startpage_ws_theme_nav",
+                    Rank = 0,
+                    LinkCount = wsThemeNav.Count,
+                    Flat = wsThemeNav.Select(x => new NavItem
+                    {
+                        Url = x.Url,
+                        Title = x.Text,
+                        Depth = 1,
+                        ParentUrl = pageUrl
+                    }).ToList()
+                });
+            }
+
             var treeMenu = await ExtractSiteVisionTreeMenuAsync(page, pageUrl, host, dropQueryStrings, maxLinks);
             if (treeMenu.Count > 0)
             {
                 groups.Add(new NavGroup
                 {
                     Id = "startpage_treemenu",
-                    Rank = 0,
+                    Rank = groups.Count == 0 ? 0 : 1,
                     LinkCount = treeMenu.Count,
                     Flat = treeMenu.Select(x => new NavItem
                     {
@@ -78,7 +96,7 @@ public sealed class CmsAwareNavExtractor
                 groups.Add(new NavGroup
                 {
                     Id = "startpage_page_listing",
-                    Rank = 1,
+                    Rank = groups.Count == 0 ? 0 : 1,
                     LinkCount = listing.Count,
                     Flat = listing.Select(x => new NavItem
                     {
@@ -421,6 +439,73 @@ async () => {
         {
             _log?.Warn($"NAV_PREPARE_WARN {ex.Message}");
         }
+    }
+
+    // Extracts level-1 navigation links from the SiteVision ws-theme hamburger drawer.
+    // The drawer (#ws-mainnavigation-container) is always aria-hidden at page load, so
+    // visibility-based extractors miss it entirely.  This method reads the DOM directly.
+    private async Task<List<PageNavLink>> ExtractSiteVisionWsThemeNavAsync(
+        IPage page,
+        string pageUrl,
+        string host,
+        bool dropQueryStrings,
+        int maxLinks)
+    {
+        var raw = await page.EvaluateAsync<JsonElement>(@"
+() => {
+  const container = document.querySelector('#ws-mainnavigation-container');
+  const containerFound = !!container;
+
+  const links = [];
+  if (containerFound) {
+    const seen = new Set();
+    const anchors = container.querySelectorAll('a.ws-mainnavigation__item__link--level1');
+    for (const a of anchors) {
+      const href = (a.getAttribute('href') || '').trim();
+      if (!href || href === '#' || href.startsWith('#') ||
+          href.startsWith('javascript:') || href.startsWith('mailto:') || href.startsWith('tel:'))
+        continue;
+
+      let abs = '';
+      try { abs = new URL(href, document.location.href).toString(); } catch { continue; }
+
+      if (seen.has(abs)) continue;
+      seen.add(abs);
+
+      let text = (a.textContent || '').replace(/\s+/g, ' ').trim();
+      if (!text) text = (a.getAttribute('aria-label') || '').trim();
+      if (!text) continue;
+
+      links.push({
+        url: abs,
+        text,
+        kind: 'ws-theme-nav',
+        sourceType: 'WsThemeNav',
+        displayRole: 'Navigation',
+        groupLabel: 'Main navigation',
+        confidence: 0.97,
+        isStructural: true
+      });
+    }
+  }
+
+  return { containerFound, links };
+}
+");
+
+        var containerFound = raw.TryGetProperty("containerFound", out var cf) && cf.GetBoolean();
+        _log?.Event("WS_THEME_NAV_FOUND", ("host", host), ("containerFound", containerFound));
+
+        if (!containerFound || !raw.TryGetProperty("links", out var linksEl) || linksEl.ValueKind != JsonValueKind.Array)
+            return new List<PageNavLink>();
+
+        var result = ParsePageNavLinks(linksEl, host, dropQueryStrings, maxLinks);
+
+        _log?.Event("WS_THEME_NAV_LINK_COUNT", ("host", host), ("count", result.Count));
+        foreach (var link in result)
+            _log?.Event("WS_THEME_NAV_ACCEPTED", ("host", host), ("url", link.Url), ("text", link.Text));
+
+        return result;
     }
 
     private async Task<List<PageNavLink>> ExtractSiteVisionTreeMenuAsync(
