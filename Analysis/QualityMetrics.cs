@@ -69,8 +69,29 @@ public sealed class QualityMetrics
 
     // Root-child quality metrics — a high deepRootChildCount indicates
     // that leaf pages are being dumped at root due to missing intermediate parents.
+
+    // Raw flat-array count: depth=1 items whose parentUrl == startUrl.
+    // Includes crawl artifacts from visible-module-fallback groups (shortcuts, events)
+    // that are not tree root children. Use TreeRootChildCount / ViewerRootSectionCount
+    // for navigation quality assessment.
     [JsonPropertyName("rootChildCount")]
     public int RootChildCount { get; set; }
+
+    // Tree root children: nodes[0].children.Count — direct children of the root node
+    // in the navigation tree before MunicipalRootClassifier runs. Equal to or smaller
+    // than RootChildCount; the gap is crawl artifacts present only in the flat array.
+    [JsonPropertyName("treeRootChildCount")]
+    public int TreeRootChildCount { get; set; }
+
+    // Viewer root sections: root children that MunicipalRootClassifier accepts as
+    // EligibleStructuralRoot — what the viewer shows as primary IA sections.
+    [JsonPropertyName("viewerRootSectionCount")]
+    public int ViewerRootSectionCount { get; set; }
+
+    // Demoted root children: tree root children classified by MunicipalRootClassifier
+    // as non-eligible (NewsOrEventRoot, UtilityRoot, DiscoveredOtherRoot, etc.).
+    [JsonPropertyName("demotedRootCount")]
+    public int DemotedRootCount { get; set; }
 
     [JsonPropertyName("deepRootChildCount")]
     public int DeepRootChildCount { get; set; }

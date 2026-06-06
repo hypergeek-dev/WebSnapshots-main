@@ -3199,6 +3199,32 @@ DrainNavigationQueue:
                 ["demotedCount"] = demoted
             });
 
+        // Three-layer root count breakdown — explains the gap between flat array and viewer.
+        // flatDepth1Count includes crawl artifacts (visible-module-fallback seeds) not in tree root.
+        var flatDepth1Count = allFlat.Count(x =>
+            !string.IsNullOrWhiteSpace(x.Url) &&
+            !CanonicalUrlKey(x.Url).Equals(canonicalStart, StringComparison.OrdinalIgnoreCase) &&
+            !string.IsNullOrWhiteSpace(x.ParentUrl) &&
+            CanonicalUrlKey(x.ParentUrl).Equals(canonicalStart, StringComparison.OrdinalIgnoreCase));
+        var artifactCount = Math.Max(0, flatDepth1Count - beforeRootCount);
+
+        log?.Event("ROOT_COUNT_LAYERS",
+            ("flatDepth1Count", flatDepth1Count),
+            ("treeRootChildCount", beforeRootCount),
+            ("filterAcceptedCount", accepted),
+            ("filterDemotedCount", demoted),
+            ("artifactCount", artifactCount));
+
+        telemetry?.Emit(TelemetryPhase.TreeBuilding, "ROOT_COUNT_LAYERS", TelemetrySeverity.Info,
+            startUrl, new Dictionary<string, object?>
+            {
+                ["flatDepth1Count"] = flatDepth1Count,
+                ["treeRootChildCount"] = beforeRootCount,
+                ["filterAcceptedCount"] = accepted,
+                ["filterDemotedCount"] = demoted,
+                ["artifactCount"] = artifactCount
+            });
+
         return visibleTreeFlat;
 
     }
@@ -3970,8 +3996,10 @@ DrainNavigationQueue:
         AddEvidence(d, !r.tinyOrHidden, "not_hidden_tiny_link", "hidden_tiny_link", 0.05, -0.24, ref score);
 
         d.Confidence = Clamp01(score);
-        if (r.pathSegments != 1 || r.articleLike)
-            d.Confidence = Math.Min(d.Confidence, 0.62);
+        if (r.pathSegments != 1)
+            d.Confidence = Math.Min(d.Confidence, 0.62);  // depth-mismatch cap — enables e.g. /category/XXXX paths
+        if (r.articleLike)
+            d.Confidence = Math.Min(d.Confidence, 0.58);  // article-pattern cap — always below threshold
         d.Accepted = d.Confidence >= d.Threshold;
         d.FinalReason = d.Accepted ? "accepted:confidence_at_or_above_threshold" : "rejected:confidence_below_threshold";
         return d;

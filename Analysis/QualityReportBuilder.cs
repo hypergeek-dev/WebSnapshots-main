@@ -174,6 +174,9 @@ public static class QualityReportBuilder
                 report.Metrics.DeepLeafRootChildren    = deepLeafRoot;
                 report.Metrics.SingletonRootChildren   = singletonRoot;
                 report.Metrics.RootTopologyVerdict     = GetRootTopologyVerdict(report.Metrics);
+
+                // Three-layer root breakdown: flat / tree / viewer.
+                ComputeRootLayerMetrics(nav, report.Metrics);
             }
 
             // host / startUrl from nav if not set
@@ -194,6 +197,64 @@ public static class QualityReportBuilder
         foreach (var n in nodes)
             count += 1 + CountTreeNodes(n.Children);
         return count;
+    }
+
+    // Computes three-layer root breakdown from nav.json tree structure.
+    // treeRootChildCount  — nodes[0].children (before classifier)
+    // viewerRootSectionCount — children MunicipalRootClassifier accepts (EligibleStructuralRoot)
+    // demotedRootCount   — children classifier demotes (NewsOrEventRoot, UtilityRoot, etc.)
+    private static void ComputeRootLayerMetrics(NavIndex nav, QualityMetrics m)
+    {
+        if (nav.Nodes.Count == 0) return;
+        var rootChildren = nav.Nodes[0].Children;
+        if (rootChildren == null || rootChildren.Count == 0) return;
+
+        m.TreeRootChildCount = rootChildren.Count;
+
+        // Build classifier context inputs from nav data.
+        var primaryKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (nav.NavGroups?.Count > 0)
+        {
+            var primary = nav.NavGroups.OrderBy(g => g.Rank).First();
+            foreach (var it in primary.Flat ?? new List<NavItem>())
+                if (!string.IsNullOrWhiteSpace(it.Url))
+                    primaryKeys.Add(it.Url.ToLowerInvariant().TrimEnd('/'));
+        }
+
+        var anchorKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var hs in nav.HomepageSections ?? new List<HomepageSection>())
+            if (!string.IsNullOrWhiteSpace(hs.Url))
+                anchorKeys.Add(hs.Url.ToLowerInvariant().TrimEnd('/'));
+
+        var flatByUrl = new Dictionary<string, NavItem>(StringComparer.OrdinalIgnoreCase);
+        foreach (var it in nav.Flat ?? new List<NavItem>())
+            if (!string.IsNullOrWhiteSpace(it.Url))
+                flatByUrl.TryAdd(it.Url.ToLowerInvariant().TrimEnd('/'), it);
+
+        var accepted = 0;
+        var demoted = 0;
+
+        foreach (var child in rootChildren)
+        {
+            if (string.IsNullOrWhiteSpace(child.Url)) continue;
+            var key = child.Url.ToLowerInvariant().TrimEnd('/');
+            flatByUrl.TryGetValue(key, out var flatItem);
+            var item = flatItem ?? new NavItem { Url = child.Url, Title = child.Title };
+            var decision = MunicipalRootClassifier.Classify(item, new MunicipalRootContext
+            {
+                StartUrl = nav.StartUrl ?? "",
+                WasPrimaryNav = primaryKeys.Contains(key),
+                WasAcceptedHomepageAnchor = anchorKeys.Contains(key),
+                HadChildren = (child.Children?.Count ?? 0) > 0,
+                SourceGroup = "quality_report",
+                BeforeRootCount = rootChildren.Count
+            });
+            if (decision.IsEligible) accepted++;
+            else demoted++;
+        }
+
+        m.ViewerRootSectionCount = accepted;
+        m.DemotedRootCount = demoted;
     }
 
     // ── Telemetry metrics from telemetry.jsonl ────────────────────────────────
@@ -757,7 +818,10 @@ public static class QualityReportBuilder
         sb.AppendLine($"| Max depth reached | {m.MaxDepthReached} |");
         sb.AppendLine($"| Max pages reached | {m.MaxPagesReached} |");
         sb.AppendLine($"| Pages captured | {m.PagesCaptured} |");
-        sb.AppendLine($"| Root children | {m.RootChildCount} |");
+        sb.AppendLine($"| Root children (flat depth=1) | {m.RootChildCount} |");
+        sb.AppendLine($"| Root children (tree, before classifier) | {m.TreeRootChildCount} |");
+        sb.AppendLine($"| Root sections (viewer, after classifier) | {m.ViewerRootSectionCount} |");
+        sb.AppendLine($"| Demoted root children | {m.DemotedRootCount} |");
         sb.AppendLine($"| Deep root children (path≥2) | {m.DeepRootChildCount} |");
         sb.AppendLine($"| Root topology verdict | {m.RootTopologyVerdict} |");
         sb.AppendLine($"| Synthetic parent nodes | {m.SyntheticParentCount} |");

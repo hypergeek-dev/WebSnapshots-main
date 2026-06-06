@@ -127,6 +127,10 @@ overnight*/
 /overnight_batch*/
 /overnight_batch_sitevision*/
 /archive_inventory/
+/snapshots/
+/landingpage_intelligence/
+/landingpage_vs_snapshot_analysis/
+/after_ai_reassessment/
 publish/
 *.zip
 *.tmp
@@ -452,7 +456,6 @@ FodyWeavers.xsd
 /output_manual_test
 /output/
 /overnight_batch/
-/Analysis/
 sites_overnight_real.txt
 sites_precaution_run.txt
 sites_root_purity_klippan_validate.txt
@@ -477,3 +480,11 @@ _audit_screenshot.csx
 _audit_tool/audit_tool.csproj
 .tmp_*
 VIEWER_CLASSIFICATION_INVESTIGATION.md
+CAP_FIX_VALIDATION.md
+ROOT_LAYERS_VALIDATION.md
+HOMEPAGE_ANCHOR_THRESHOLD_INVESTIGATION.md
+SIMRISHAMN_WS_THEME_INVESTIGATION.md
+sites.txt
+SITEVISION_FIX_EFFECTIVENESS_REPORT.md
+SITEVISION_UTILITY_CLASSIFICATION_VALIDATION.md
+THRESHOLD_062_SIMULATION.md
