@@ -233,6 +233,14 @@ public static class QualityReportBuilder
 
         var accepted = 0;
         var demoted = 0;
+        var duplicateRootKeys = rootChildren
+            .GroupBy(x => MunicipalRootClassifier.CanonicalRootContentKey(x.Url), StringComparer.OrdinalIgnoreCase)
+            .Where(g => !string.IsNullOrWhiteSpace(g.Key) && g.Count() > 1)
+            .SelectMany(g => g
+                .OrderByDescending(x => x.Children?.Count ?? 0)
+                .Skip(1))
+            .Select(x => MunicipalRootClassifier.CanonicalUrlKey(x.Url))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
         foreach (var child in rootChildren)
         {
@@ -246,6 +254,7 @@ public static class QualityReportBuilder
                 WasPrimaryNav = primaryKeys.Contains(key),
                 WasAcceptedHomepageAnchor = anchorKeys.Contains(key),
                 HadChildren = (child.Children?.Count ?? 0) > 0,
+                HasCanonicalDuplicate = duplicateRootKeys.Contains(MunicipalRootClassifier.CanonicalUrlKey(child.Url)),
                 SourceGroup = "quality_report",
                 BeforeRootCount = rootChildren.Count
             });

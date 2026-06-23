@@ -128,6 +128,18 @@ public sealed class NavItem
     [System.Text.Json.Serialization.JsonIgnore(
         Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingDefault)]
     public string MunicipalRootClassification { get; set; } = "";
+
+    [System.Text.Json.Serialization.JsonIgnore(
+        Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingDefault)]
+    public double MunicipalRootConfidence { get; set; } = 0;
+
+    [System.Text.Json.Serialization.JsonIgnore(
+        Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingDefault)]
+    public List<string>? MunicipalRootReasons { get; set; }
+
+    [System.Text.Json.Serialization.JsonIgnore(
+        Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingDefault)]
+    public List<string>? MunicipalRootEvidenceSignals { get; set; }
 }
 
 public sealed class NavNode

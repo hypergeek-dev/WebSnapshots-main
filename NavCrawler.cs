@@ -3049,6 +3049,21 @@ DrainNavigationQueue:
                      && CanonicalUrlKey(x.ParentUrl).Equals(canonicalStart, StringComparison.OrdinalIgnoreCase))
             .ToList();
 
+        var duplicateRootKeys = rootItems
+            .GroupBy(x => MunicipalRootClassifier.CanonicalRootContentKey(x.Url), StringComparer.OrdinalIgnoreCase)
+            .Where(g => !string.IsNullOrWhiteSpace(g.Key) && g.Count() > 1)
+            .SelectMany(g => g
+                .OrderByDescending(x =>
+                {
+                    var key = CanonicalUrlKey(x.Url);
+                    return childrenByParent.TryGetValue(key, out var kids) ? kids.Count : 0;
+                })
+                .ThenByDescending(x => protectedPrimaryRootKeys.Contains(CanonicalUrlKey(x.Url)))
+                .ThenBy(x => x.IsSynthetic)
+                .Skip(1))
+            .Select(x => MunicipalRootClassifier.CanonicalUrlKey(x.Url))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
         var beforeRootCount = rootItems.Count;
         if (beforeRootCount == 0)
             return visibleTreeFlat;
@@ -3058,6 +3073,13 @@ DrainNavigationQueue:
         var warningClassifications = new HashSet<MunicipalRootClassificationKind>
         {
             MunicipalRootClassificationKind.MicrositeRoot,
+            MunicipalRootClassificationKind.NewsRoot,
+            MunicipalRootClassificationKind.EventsRoot,
+            MunicipalRootClassificationKind.ArchivesRoot,
+            MunicipalRootClassificationKind.SystemPageRoot,
+            MunicipalRootClassificationKind.ErrorPageRoot,
+            MunicipalRootClassificationKind.DuplicateContentRoot,
+            MunicipalRootClassificationKind.CmsHelperRoot,
             MunicipalRootClassificationKind.NewsOrEventRoot,
             MunicipalRootClassificationKind.ErrorOrSystemRoot,
             MunicipalRootClassificationKind.UtilityRoot
@@ -3074,13 +3096,14 @@ DrainNavigationQueue:
                 WasPrimaryNav = wasPrimary,
                 WasAcceptedHomepageAnchor = acceptedHomepageKeys.Contains(itemKey),
                 HadChildren = hadChildren,
+                HasCanonicalDuplicate = duplicateRootKeys.Contains(MunicipalRootClassifier.CanonicalUrlKey(item.Url)),
                 SourceGroup = "visible_tree_root",
                 BeforeRootCount = beforeRootCount
             });
 
-            item.MunicipalRootClassification = decision.KindName;
-            if (decision.Kind == MunicipalRootClassificationKind.UtilityRoot)
-                item.IsUtility = true;
+            ApplyMunicipalRootDecision(item, decision);
+            foreach (var sourceItem in allFlat.Where(x => CanonicalUrlKey(x.Url).Equals(itemKey, StringComparison.OrdinalIgnoreCase)))
+                ApplyMunicipalRootDecision(sourceItem, decision);
 
             log?.Event("MUNICIPAL_ROOT_CLASSIFIED",
                 ("title", item.Title),
@@ -3227,6 +3250,16 @@ DrainNavigationQueue:
 
         return visibleTreeFlat;
 
+    }
+
+    private static void ApplyMunicipalRootDecision(NavItem item, MunicipalRootClassification decision)
+    {
+        item.MunicipalRootClassification = decision.KindName;
+        item.MunicipalRootConfidence = decision.Confidence;
+        item.MunicipalRootReasons = decision.Reasons.ToList();
+        item.MunicipalRootEvidenceSignals = decision.EvidenceSignals.ToList();
+        if (decision.Kind == MunicipalRootClassificationKind.UtilityRoot)
+            item.IsUtility = true;
     }
 
     private static bool IsTopLevelSiteVisionNumericPage(string url)

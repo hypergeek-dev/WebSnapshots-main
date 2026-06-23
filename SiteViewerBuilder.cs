@@ -441,6 +441,16 @@ public sealed class SiteViewerBuilder
         {
             var rootChildren = nodes[0].Children ?? new List<NavNode>();
             var beforeRootCount = rootChildren.Count;
+            var duplicateRootKeys = rootChildren
+                .GroupBy(x => MunicipalRootClassifier.CanonicalRootContentKey(x.Url), StringComparer.OrdinalIgnoreCase)
+                .Where(g => !string.IsNullOrWhiteSpace(g.Key) && g.Count() > 1)
+                .SelectMany(g => g
+                    .OrderByDescending(x => x.Children?.Count ?? 0)
+                    .ThenByDescending(x => primaryRootUrlsLower.Contains(Utils.NormalizeUrl(x.Url, dropQueryStrings).ToLowerInvariant()))
+                    .Skip(1))
+                .Select(x => MunicipalRootClassifier.CanonicalUrlKey(x.Url))
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
             foreach (var child in rootChildren)
             {
                 if (string.IsNullOrWhiteSpace(child.Url)) continue;
@@ -453,6 +463,7 @@ public sealed class SiteViewerBuilder
                     WasPrimaryNav = primaryRootUrlsLower.Contains(key),
                     WasAcceptedHomepageAnchor = homepageSectionUrlsLower.Contains(key),
                     HadChildren = (child.Children?.Count ?? 0) > 0,
+                    HasCanonicalDuplicate = duplicateRootKeys.Contains(MunicipalRootClassifier.CanonicalUrlKey(child.Url)),
                     SourceGroup = "viewer_root_grouping",
                     BeforeRootCount = beforeRootCount
                 });
@@ -488,11 +499,15 @@ public sealed class SiteViewerBuilder
                 }
                 else
                 {
+                    item.MunicipalRootClassification = decision.KindName;
+                    item.MunicipalRootConfidence = decision.Confidence;
+                    item.MunicipalRootReasons = decision.Reasons.ToList();
+                    item.MunicipalRootEvidenceSignals = decision.EvidenceSignals.ToList();
+
                     if (decision.Kind == MunicipalRootClassificationKind.UtilityRoot)
                         utilityUrlsLower.Add(key);
                     else
                     {
-                        item.MunicipalRootClassification = decision.KindName;
                         discoveredKindMap[key] = decision.KindName;
                     }
 
@@ -782,7 +797,7 @@ public sealed class SiteViewerBuilder
         sb.AppendLine("            if (structuralRootUrls.has(ku)) structural.push(kid);");
         sb.AppendLine("            else if (utilityUrls.has(ku)) utility.push(kid);");
         sb.AppendLine("            else if (discoveredUrls.has(ku)) discovered.push(kid);");
-        sb.AppendLine("            else structural.push(kid);");
+        sb.AppendLine("            else discovered.push(kid);");
         sb.AppendLine("          }");
 
         // Sort structural by homepage section order (Phase 2)
@@ -822,18 +837,29 @@ public sealed class SiteViewerBuilder
         sb.AppendLine("          if (discovered.length) {");
         sb.AppendLine("            const dOpen = !!f;");
         sb.AppendLine("            function discSub(kid) {");
+        sb.AppendLine("              const kind = discoveredKindMap[normUrl(kid.url || '')] || '';");
+        sb.AppendLine("              if (kind === 'NewsRoot' || kind === 'NewsOrEventRoot') return 'news';");
+        sb.AppendLine("              if (kind === 'EventsRoot') return 'current';");
+        sb.AppendLine("              if (kind === 'ArchivesRoot') return 'archive';");
+        sb.AppendLine("              if (kind === 'SystemPageRoot' || kind === 'ErrorPageRoot' || kind === 'ErrorOrSystemRoot' || kind === 'CmsHelperRoot' || kind === 'DuplicateContentRoot') return 'system';");
         sb.AppendLine("              const seg = normUrl(kid.url || '').replace(/.*?:\\/\\/[^/]+\\//, '').split('/')[0];");
         sb.AppendLine("              if (/^(nyheter|nyhet|news|pressmeddelanden?)/.test(seg)) return 'news';");
         sb.AppendLine("              if (/^(event|evenemang|kalender|anslag|lediga|jobb|aktuellt|kampanj|drift)/.test(seg)) return 'current';");
+        sb.AppendLine("              if (/^(arkiv|archive)/.test(seg)) return 'archive';");
+        sb.AppendLine("              if (/^(sok|search|error|404|page-not-found|dolda-sidor)/.test(seg)) return 'system';");
         sb.AppendLine("              return 'other';");
         sb.AppendLine("            }");
         sb.AppendLine("            const discNews    = discovered.filter(n => discSub(n) === 'news');");
         sb.AppendLine("            const discCurrent = discovered.filter(n => discSub(n) === 'current');");
+        sb.AppendLine("            const discArchive = discovered.filter(n => discSub(n) === 'archive');");
+        sb.AppendLine("            const discSystem  = discovered.filter(n => discSub(n) === 'system');");
         sb.AppendLine("            const discOther   = discovered.filter(n => discSub(n) === 'other');");
         sb.AppendLine("            const dnParts = discNews.map(n    => buildTreeNode(n, 0, filter, 'tree-link')).filter(x => x.visible);");
         sb.AppendLine("            const dcParts = discCurrent.map(n => buildTreeNode(n, 0, filter, 'tree-link')).filter(x => x.visible);");
+        sb.AppendLine("            const daParts = discArchive.map(n => buildTreeNode(n, 0, filter, 'tree-link')).filter(x => x.visible);");
+        sb.AppendLine("            const dsParts = discSystem.map(n  => buildTreeNode(n, 0, filter, 'tree-link')).filter(x => x.visible);");
         sb.AppendLine("            const doParts = discOther.map(n   => buildTreeNode(n, 0, filter, 'tree-link')).filter(x => x.visible);");
-        sb.AppendLine("            const anyDisc = dnParts.length || dcParts.length || doParts.length;");
+        sb.AppendLine("            const anyDisc = dnParts.length || dcParts.length || daParts.length || dsParts.length || doParts.length;");
         sb.AppendLine("            if (anyDisc) {");
         sb.AppendLine("              html += '<button class=\"sectionToggle\" data-target=\"discBody\" type=\"button\">';");
         sb.AppendLine("              html += '<span class=\"sectionArrow\">' + (dOpen ? '\\u25BE' : '\\u25B8') + '</span>';");
@@ -848,6 +874,14 @@ public sealed class SiteViewerBuilder
         sb.AppendLine("              if (dcParts.length) {");
         sb.AppendLine("                html += '<div class=\"discSubLabel\">Aktuellt</div>';");
         sb.AppendLine("                html += '<div class=\"tree\"><ul class=\"tree-root\">' + dcParts.map(x => x.html).join('') + '</ul></div>';");
+        sb.AppendLine("              }");
+        sb.AppendLine("              if (daParts.length) {");
+        sb.AppendLine("                html += '<div class=\"discSubLabel\">Arkiv</div>';");
+        sb.AppendLine("                html += '<div class=\"tree\"><ul class=\"tree-root\">' + daParts.map(x => x.html).join('') + '</ul></div>';");
+        sb.AppendLine("              }");
+        sb.AppendLine("              if (dsParts.length) {");
+        sb.AppendLine("                html += '<div class=\"discSubLabel\">System</div>';");
+        sb.AppendLine("                html += '<div class=\"tree\"><ul class=\"tree-root\">' + dsParts.map(x => x.html).join('') + '</ul></div>';");
         sb.AppendLine("              }");
         sb.AppendLine("              if (doParts.length) {");
         sb.AppendLine("                html += '<div class=\"discSubLabel\">\\u00D6vrigt</div>';");

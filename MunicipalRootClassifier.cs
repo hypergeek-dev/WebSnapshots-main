@@ -11,6 +11,13 @@ public enum MunicipalRootClassificationKind
     UtilityRoot,
     HomepageModuleRoot,
     MicrositeRoot,
+    NewsRoot,
+    EventsRoot,
+    ArchivesRoot,
+    SystemPageRoot,
+    ErrorPageRoot,
+    DuplicateContentRoot,
+    CmsHelperRoot,
     NewsOrEventRoot,
     ErrorOrSystemRoot,
     DiscoveredOtherRoot
@@ -35,6 +42,7 @@ public sealed class MunicipalRootContext
     public bool WasPrimaryNav { get; init; }
     public bool WasAcceptedHomepageAnchor { get; init; }
     public bool HadChildren { get; init; }
+    public bool HasCanonicalDuplicate { get; init; }
     public string SourceGroup { get; init; } = "";
     public int BeforeRootCount { get; init; }
 }
@@ -49,17 +57,40 @@ public static class MunicipalRootClassifier
         var evidence = new List<string>();
         var reasons = new List<string>();
 
+        if (context.HasCanonicalDuplicate)
+            return Decision(MunicipalRootClassificationKind.DuplicateContentRoot, false, 0.90,
+                reasons, evidence, sourceSignals, "duplicate_canonical_root_variant");
+
         if (IsStartPageAlias(url, context.StartUrl))
-            return Decision(MunicipalRootClassificationKind.HomepageModuleRoot, false, 1.0,
+            return Decision(MunicipalRootClassificationKind.CmsHelperRoot, false, 1.0,
                 reasons, evidence, sourceSignals, "homepage_alias_root");
 
+        if (item.IsSynthetic && context.HadChildren)
+        {
+            var syntheticScore = ScoreMunicipalIaRoot(url, title, evidence);
+            if (syntheticScore >= 0.55 || context.WasPrimaryNav || context.WasAcceptedHomepageAnchor)
+            {
+                evidence.Add("synthetic_structural_prefix_with_children");
+                return Decision(MunicipalRootClassificationKind.EligibleStructuralRoot, true, Clamp01(Math.Max(0.70, syntheticScore)),
+                    reasons, evidence, sourceSignals, "synthetic_prefix_represents_municipal_ia_section");
+            }
+        }
+
         if (item.IsSynthetic)
-            return Decision(MunicipalRootClassificationKind.DiscoveredOtherRoot, false, 0.85,
+            return Decision(MunicipalRootClassificationKind.CmsHelperRoot, false, 0.85,
                 reasons, evidence, sourceSignals, "synthetic_helper_or_discovered_bucket");
 
-        if (IsUtilityPage(url, title) || item.IsUtility)
-            return Decision(MunicipalRootClassificationKind.UtilityRoot, false, 0.95,
-                reasons, evidence, sourceSignals, "utility_or_meta_page");
+        if (IsErrorPageRoot(url, title))
+            return Decision(MunicipalRootClassificationKind.ErrorPageRoot, false, 0.99,
+                reasons, evidence, sourceSignals, "error_page_root");
+
+        if (IsSystemPageRoot(url, title))
+            return Decision(MunicipalRootClassificationKind.SystemPageRoot, false, 0.97,
+                reasons, evidence, sourceSignals, "system_page_root");
+
+        if (IsArchiveRoot(url, title))
+            return Decision(MunicipalRootClassificationKind.ArchivesRoot, false, 0.96,
+                reasons, evidence, sourceSignals, "cms_archive_root");
 
         if (IsErrorOrSystemRoot(url, title))
             return Decision(MunicipalRootClassificationKind.ErrorOrSystemRoot, false, 0.98,
@@ -69,9 +100,22 @@ public static class MunicipalRootClassifier
             return Decision(MunicipalRootClassificationKind.MicrositeRoot, false, 0.95,
                 reasons, evidence, sourceSignals, "microsite_or_special_purpose_portal");
 
-        if (IsNewsEventOrServiceRoot(url, title))
-            return Decision(MunicipalRootClassificationKind.NewsOrEventRoot, false, 0.92,
-                reasons, evidence, sourceSignals, "news_event_service_or_notice_root");
+        if (IsNewsRoot(url, title))
+            return Decision(MunicipalRootClassificationKind.NewsRoot, false, 0.93,
+                reasons, evidence, sourceSignals, "news_feed_or_article_root");
+
+        if (IsEventsRoot(url, title))
+            return Decision(MunicipalRootClassificationKind.EventsRoot, false, 0.93,
+                reasons, evidence, sourceSignals, "event_feed_or_calendar_root");
+
+        if ((IsUtilityPage(url, title) || item.IsUtility)
+            && !IsProtectedPrimaryUtilityRoot(url, title, context, evidence))
+            return Decision(MunicipalRootClassificationKind.UtilityRoot, false, 0.95,
+                reasons, evidence, sourceSignals, "utility_or_meta_page");
+
+        if (IsCmsHelperRoot(url, title))
+            return Decision(MunicipalRootClassificationKind.CmsHelperRoot, false, 0.90,
+                reasons, evidence, sourceSignals, "cms_generated_helper_root");
 
         var isNoticeboardRoot = IsNoticeboardRoot(url, title);
         if (isNoticeboardRoot)
@@ -201,6 +245,16 @@ public static class MunicipalRootClassifier
     public static string CanonicalUrlKey(string? url)
         => CanonicalDisplayUrl(url).ToLowerInvariant();
 
+    public static string CanonicalRootContentKey(string? url)
+    {
+        var key = CanonicalUrlKey(url);
+        if (key.EndsWith(".html", StringComparison.OrdinalIgnoreCase))
+            return key[..^5];
+        if (key.EndsWith(".htm", StringComparison.OrdinalIgnoreCase))
+            return key[..^4];
+        return key;
+    }
+
     public static string CanonicalDisplayUrl(string? url)
     {
         if (string.IsNullOrWhiteSpace(url)) return "";
@@ -271,6 +325,7 @@ public static class MunicipalRootClassifier
         if (context.WasPrimaryNav) signals.Add("wasPrimaryNav");
         if (context.WasAcceptedHomepageAnchor) signals.Add("acceptedHomepageAnchor");
         if (context.HadChildren) signals.Add("hadChildren");
+        if (context.HasCanonicalDuplicate) signals.Add("canonicalDuplicate");
         if (item.IsUtility) signals.Add("itemMarkedUtility");
         if (item.IsSynthetic) signals.Add("itemMarkedSynthetic");
         if (item.IsDisplayOnly) signals.Add("itemMarkedDisplayOnly");
@@ -295,11 +350,27 @@ public static class MunicipalRootClassifier
 
     private static bool IsErrorOrSystemRoot(string url, string title)
     {
+        return IsErrorPageRoot(url, title) || IsSystemPageRoot(url, title);
+    }
+
+    private static bool IsErrorPageRoot(string url, string title)
+    {
         var text = NormalizeText(title + " " + NormalizedPathText(url));
         var tokens = new[]
         {
-            "sidan hittades inte", "page not found", "404", "error",
-            "psidata", "ticket server", "system", "sok", "search"
+            "sidan hittades inte", "sidan kunde inte hittas", "page not found",
+            "404", "felsida", "error", "not found"
+        };
+        return tokens.Any(t => text.Contains(t, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool IsSystemPageRoot(string url, string title)
+    {
+        var text = NormalizeText(title + " " + NormalizedPathText(url));
+        var tokens = new[]
+        {
+            "psidata", "ticket server", "sok", "search", "page-not-found",
+            "dolda sidor", "dolda-sidor", "ovrigt"
         };
         return tokens.Any(t => text.Contains(t, StringComparison.OrdinalIgnoreCase));
     }
@@ -330,6 +401,11 @@ public static class MunicipalRootClassifier
 
     private static bool IsNewsEventOrServiceRoot(string url, string title)
     {
+        return IsArchiveRoot(url, title) || IsNewsRoot(url, title) || IsEventsRoot(url, title);
+    }
+
+    private static bool IsArchiveRoot(string url, string title)
+    {
         // CMS-generated category/archive pages carry a title prefix such as "Arkiv: " (Swedish
         // WordPress) or "Archive: " (English WordPress/other CMS). These pages are auto-generated
         // and are not municipality-authored IA sections regardless of what their URL contains.
@@ -341,17 +417,29 @@ public static class MunicipalRootClassifier
         var text = NormalizeText(title + " " + NormalizedPathText(url));
         var segments = PathSegments(url).Select(NormalizeText).ToArray();
         var first = segments.FirstOrDefault() ?? "";
+        if (first.Equals("arkiv", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        var archiveTokens = new[]
+        {
+            "nyhetsarkiv", "evenemangsarkiv", "eventarkiv", "archive", "arkiv"
+        };
+        return archiveTokens.Any(t => text.Contains(t, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool IsNewsRoot(string url, string title)
+    {
+        var text = NormalizeText(title + " " + NormalizedPathText(url));
+        var segments = PathSegments(url).Select(NormalizeText).ToArray();
+        var first = segments.FirstOrDefault() ?? "";
 
         var rootTokens = new[]
         {
-            "nyhet", "nyheter", "huvudnyheter", "evenemang", "event",
-            "kalender", "aktuellt", "servicemeddelanden", "service meddelanden",
-            "drift", "driftsinformation", "kampanj", "pressmeddelande"
+            "nyhet", "nyheter", "huvudnyheter", "news", "newsletter",
+            "servicemeddelanden", "service meddelanden", "drift",
+            "driftsinformation", "kampanj", "pressmeddelande"
         };
         if (rootTokens.Any(t => first.Contains(t, StringComparison.OrdinalIgnoreCase)))
-            return true;
-
-        if (first.Equals("anslag", StringComparison.OrdinalIgnoreCase))
             return true;
 
         if (Regex.IsMatch(text, @"\b20\d{2}\b") && !text.Contains("anslagstavla", StringComparison.OrdinalIgnoreCase))
@@ -364,6 +452,63 @@ public static class MunicipalRootClassifier
             "subvention for trygghetsboende"
         };
         return titleTokens.Any(t => text.Contains(t, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool IsEventsRoot(string url, string title)
+    {
+        var text = NormalizeText(title + " " + NormalizedPathText(url));
+        var segments = PathSegments(url).Select(NormalizeText).ToArray();
+        var first = segments.FirstOrDefault() ?? "";
+        var rootTokens = new[]
+        {
+            "evenemang", "event", "kalender", "aktuellt", "anslag",
+            "lediga"
+        };
+        return rootTokens.Any(t => first.Contains(t, StringComparison.OrdinalIgnoreCase))
+            || text.Contains("evenemangskalender", StringComparison.OrdinalIgnoreCase)
+            || first.Equals("lediga-jobb", StringComparison.OrdinalIgnoreCase)
+            || first.Equals("lediga jobb", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsCmsHelperRoot(string url, string title)
+    {
+        var text = NormalizeText(title + " " + NormalizedPathText(url));
+        var segments = PathSegments(url).Select(NormalizeText).ToArray();
+
+        if (segments.Any(s => s is "tag" or "tags" or "category" or "taxonomy" or "feed" or "rss" or "wp-json"))
+            return true;
+
+        var tokens = new[]
+        {
+            "sitemap.xml", "robots.txt"
+        };
+        return tokens.Any(t => text.Contains(t, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool IsProtectedPrimaryUtilityRoot(
+        string url,
+        string title,
+        MunicipalRootContext context,
+        List<string> evidence)
+    {
+        if (!context.WasPrimaryNav && !context.WasAcceptedHomepageAnchor)
+            return false;
+
+        var text = NormalizeText(title + " " + NormalizedPathText(url));
+        var protectedTokens = new[]
+        {
+            "kontakt", "press", "sjalvservice", "sjalv service",
+            "e tjanst", "e-tjanst", "etjanst", "blankett"
+        };
+
+        if (!protectedTokens.Any(t => text.Contains(t, StringComparison.OrdinalIgnoreCase)))
+            return false;
+
+        if (!context.HadChildren && !context.WasAcceptedHomepageAnchor)
+            return false;
+
+        evidence.Add("protected_primary_utility_signal");
+        return true;
     }
 
     private static bool IsNoticeboardRoot(string url, string title)
